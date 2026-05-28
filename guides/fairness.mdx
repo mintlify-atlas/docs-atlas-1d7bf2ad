@@ -1,0 +1,196 @@
+---
+title: "Fairness Queues: Per-Tenant Round-Robin Processing"
+sidebarTitle: "Fairness Queues"
+description: "Use Broccoli Queue's fairness queue feature to process messages in round-robin order across multiple tenants or workloads using a disambiguator key."
+---
+
+In a standard queue, a tenant that enqueues thousands of messages will monopolise workers while other tenants wait — the classic "noisy neighbour" problem. Broccoli Queue's fairness queue feature solves this by grouping messages into per-tenant sub-queues and cycling through them in round-robin order, so every active tenant receives an equal share of worker time regardless of their individual queue depth.
+
+<Note>
+  Fairness queues are currently only supported by the **Redis broker**. Setting `ConsumeOptions::fairness(true)` has no effect when using RabbitMQ or SurrealDB.
+</Note>
+
+---
+
+## How It Works
+
+When you publish a message with a non-`None` `disambiguator`, Broccoli stores it in a per-disambiguator sorted set (`{topic}_{disambiguator}_queue`) rather than the main topic queue. It also records the disambiguator in a tracking set (`{topic}_fairness_set`) and a round-robin list (`{topic}_fairness_round_robin`).
+
+When a consumer runs with `fairness(true)`, it rotates through the active disambiguators one at a time — popping one message from each sub-queue in sequence. This guarantees that no single tenant can flood the pipeline.
+
+---
+
+## Publishing with a Disambiguator
+
+Pass the tenant identifier (or any string key) as the `disambiguator` argument to `publish()` or `publish_batch()`. Use `None` for messages that belong to no particular sub-queue.
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnalyticsJob { event: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    // Enqueue a job for tenant A
+    queue
+        .publish(
+            "jobs",
+            Some("tenant_a".to_string()),
+            &AnalyticsJob { event: "page_view".into() },
+            None,
+        )
+        .await?;
+
+    // Enqueue a job for tenant B
+    queue
+        .publish(
+            "jobs",
+            Some("tenant_b".to_string()),
+            &AnalyticsJob { event: "purchase".into() },
+            None,
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+---
+
+## Consuming with Fairness Enabled
+
+Enable fairness on the consumer side by setting `ConsumeOptions::builder().fairness(true)`. Pass the options to `process_messages()`, `process_messages_with_handlers()`, or any of the manual consume methods.
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnalyticsJob { event: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    let opts = ConsumeOptions::builder()
+        .fairness(true)
+        .build();
+
+    queue
+        .process_messages(
+            "jobs",
+            Some(4),
+            Some(opts),
+            |msg: BrokerMessage<AnalyticsJob>| async move {
+                println!(
+                    "Processing '{}' for {:?}",
+                    msg.payload.event,
+                    msg.disambiguator
+                );
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+Each consumed message carries a `disambiguator` field on `BrokerMessage<T>` so you always know which tenant's sub-queue the message came from.
+
+---
+
+## Batch Publishing with a Disambiguator
+
+`publish_batch()` accepts a disambiguator too — all messages in the batch are routed to the same sub-queue:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReportJob { report_id: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let jobs = vec![
+        ReportJob { report_id: "r-001".into() },
+        ReportJob { report_id: "r-002".into() },
+        ReportJob { report_id: "r-003".into() },
+    ];
+
+    queue
+        .publish_batch("jobs", Some("tenant_a".to_string()), jobs, None)
+        .await?;
+
+    println!("Enqueued 3 reports for tenant_a");
+    Ok(())
+}
+```
+
+---
+
+## Inspecting Per-Tenant Queue Sizes
+
+`queue.size()` returns a `HashMap<String, u64>`. For a fairness queue, each key is the name of a disambiguator sub-queue (`{topic}_{disambiguator}_queue`) and the value is the current message count in that sub-queue.
+
+```rust
+let sizes = queue.size("jobs").await?;
+for (sub_queue, count) in &sizes {
+    println!("{sub_queue}: {count} messages pending");
+}
+// Example output:
+// jobs_tenant_a_queue: 42 messages pending
+// jobs_tenant_b_queue: 7 messages pending
+```
+
+<Note>
+  If no disambiguator has ever published to a topic, `size()` returns a single entry keyed by the bare topic name — the same behaviour as a standard queue.
+</Note>
+
+---
+
+## Round-Robin Details
+
+Broccoli maintains a Redis list (`{topic}_fairness_round_robin`) that acts as the rotation cursor. When a consumer requests the next message:
+
+1. The head of the round-robin list is rotated to the tail.
+2. A message is popped from the corresponding sub-queue.
+3. If the sub-queue is empty that slot is skipped, and the next disambiguator is tried.
+
+This means each tenant gets at most one message processed before the next tenant gets a turn — a strict, starvation-free round-robin.
+
+---
+
+## Common Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Multi-Tenant SaaS" icon="building">
+    Isolate each customer's workload into its own sub-queue so a single bulk-importing tenant cannot starve interactive users.
+  </Card>
+  <Card title="Per-User Job Queues" icon="user">
+    Route video transcoding, report generation, or ML inference jobs by `user_id` to guarantee responsive processing for every user.
+  </Card>
+  <Card title="Per-Region Processing" icon="globe">
+    Use a region code (e.g. `"eu-west"`, `"us-east"`) as the disambiguator to distribute work evenly across geographic partitions.
+  </Card>
+  <Card title="Priority Lanes" icon="gauge-high">
+    Combine fairness with `PublishOptions::priority` to give each tenant fair access while still honouring within-tenant priority ordering.
+  </Card>
+</CardGroup>

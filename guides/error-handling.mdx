@@ -1,0 +1,251 @@
+---
+title: "Error Handling and the BroccoliError Type"
+sidebarTitle: "Error Handling"
+description: "Handle errors from Broccoli Queue operations using the BroccoliError enum. Covers broker errors, publish/consume failures, acknowledgment errors, and retry behavior."
+---
+
+Every public method in Broccoli Queue returns `Result<T, BroccoliError>`. The `BroccoliError` enum (derived from `thiserror`) covers every failure mode in the system — from low-level Redis and SurrealDB errors to application-level job failures — giving you a single, consistent type to match against regardless of which broker backend you use.
+
+---
+
+## `BroccoliError` Variants
+
+### Infrastructure Errors
+
+<CardGroup cols={1}>
+  <Card title="Broker(String)" icon="server">
+    General broker infrastructure failure: connection refused, connection pool exhausted, or pool initialisation error. This is the catch-all for problems communicating with the broker itself.
+  </Card>
+  <Card title="ConnectionTimeout(u32)" icon="clock">
+    The client timed out after attempting to connect `u32` times. The wrapped value is the number of retries that were attempted before giving up.
+  </Card>
+  <Card title="Redis(redis::RedisError)" icon="database">
+    A raw Redis protocol error passed through from the `redis` crate. Only produced when the `redis` feature is enabled.
+  </Card>
+  <Card title="SurrealDB(surrealdb::Error)" icon="database">
+    A raw SurrealDB error passed through from the `surrealdb` crate. Only produced when the `surrealdb` feature is enabled.
+  </Card>
+</CardGroup>
+
+### Concurrency Errors (SurrealDB)
+
+| Variant | Retryable? | Description |
+|---|---|---|
+| `BrokerNonIdempotentOp(String)` | ❌ No | A concurrent SurrealDB **read** conflict — multiple parallel consumers tried to read the same record simultaneously. |
+| `BrokerNonIdempotentRetriableOp(String)` | ✅ Yes | A concurrent SurrealDB **write** conflict — can be retried safely. `process_messages` logs these and continues. |
+
+### Message Lifecycle Errors
+
+| Variant | Cause |
+|---|---|
+| `Publish(String)` | Failed to send a message to the broker, or serialization of the payload failed |
+| `Consume(String)` | Failed to retrieve a message from the broker, or deserialization of the payload failed |
+| `Acknowledge(String)` | Failed to remove a message from the processing queue after successful handling |
+| `Reject(String)` | Failed to move a message to the failed queue or re-enqueue it for retry |
+| `Cancel(String)` | Failed to delete a message from the queue before it is consumed |
+| `GetMessagePosition(String)` | Failed to look up a message's position — note this operation is **not implemented** for RabbitMQ |
+
+### Serialization
+
+| Variant | Description |
+|---|---|
+| `Serialization(serde_json::Error)` | JSON deserialization failed when converting raw broker bytes back into your `T`. Wraps the underlying `serde_json::Error` directly. |
+
+### Application-Level
+
+| Variant | Description |
+|---|---|
+| `Job(String)` | General job-processing error. This is the idiomatic variant to return from your `process_messages` handler when business logic fails. |
+| `QueueStatus(String)` | Error from the management API (requires the `management` feature flag). |
+| `NotImplemented` | The requested feature is not available for the active broker. For example, `GetMessagePosition` on RabbitMQ always returns this variant. |
+
+---
+
+## Pattern Matching
+
+Match on specific variants to implement targeted recovery logic:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+use broccoli_queue::queue::BroccoliQueue;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MyJob { id: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let job = MyJob { id: "job-42".into() };
+
+    match queue.publish("jobs", None, &job, None).await {
+        Ok(msg) => println!("Published: {}", msg.task_id),
+
+        Err(BroccoliError::Publish(e)) => {
+            eprintln!("Could not publish message: {e}");
+            // maybe retry or alert
+        }
+
+        Err(BroccoliError::ConnectionTimeout(retries)) => {
+            eprintln!("Broker unreachable after {retries} retries — is Redis running?");
+            std::process::exit(1);
+        }
+
+        Err(BroccoliError::Serialization(e)) => {
+            eprintln!("Payload serialization error: {e}");
+        }
+
+        Err(e) => eprintln!("Unexpected error: {e:?}"),
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## Errors in `process_messages` Handlers
+
+When you use `process_messages()` or `process_messages_with_handlers()`, the framework interprets your handler's return value to decide what to do with the message:
+
+| Handler result | Framework action |
+|---|---|
+| `Ok(())` | Message is **acknowledged** and removed from the queue |
+| `Err(_)` | Message is **rejected** — re-enqueued for retry, or moved to `{topic}_failed` once the retry limit is reached |
+
+Return `BroccoliError::Job(...)` from your handler to signal a job-processing failure:
+
+```rust
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MyJob { id: String }
+
+async fn my_handler(msg: BrokerMessage<MyJob>) -> Result<(), BroccoliError> {
+    do_work(&msg.payload)
+        .await
+        .map_err(|e| BroccoliError::Job(e.to_string()))
+}
+
+async fn do_work(job: &MyJob) -> Result<(), String> {
+    if job.id.is_empty() {
+        return Err("Job ID must not be empty".into());
+    }
+    println!("Done with {}", job.id);
+    Ok(())
+}
+```
+
+---
+
+## Bridging Custom Errors with `thiserror`
+
+If your application defines its own error type with `thiserror`, convert it to `BroccoliError::Job` in the handler:
+
+```rust
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error("Validation failed: {0}")]
+    Validation(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MyJob { id: String }
+
+async fn handler(msg: BrokerMessage<MyJob>) -> Result<(), BroccoliError> {
+    process(&msg.payload)
+        .await
+        .map_err(|e| BroccoliError::Job(e.to_string()))
+}
+
+async fn process(job: &MyJob) -> Result<(), AppError> {
+    if job.id.is_empty() {
+        return Err(AppError::Validation("id is required".into()));
+    }
+    Ok(())
+}
+```
+
+---
+
+## The Failed Queue
+
+When a message is rejected and has exhausted its retry attempts (default: 3, configured via `RetryStrategy`), Broccoli moves it to a dead-letter queue named `{topic}_failed`. For fairness queues the name is `{topic}_{disambiguator}_failed`.
+
+You can inspect or reprocess failed messages by consuming from the failed queue directly:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MyJob { id: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    // Consume from the dead-letter queue
+    queue
+        .process_messages(
+            "jobs_failed",
+            Some(1),
+            None,
+            |msg: BrokerMessage<MyJob>| async move {
+                eprintln!(
+                    "Dead-letter job {} after {} attempts",
+                    msg.payload.id, msg.attempts
+                );
+                // alert, archive, or re-publish after investigation
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+<Tip>
+  Use `process_messages_with_handlers()` on `{topic}_failed` to separate the alerting / archiving logic from the consumption logic, keeping each callback focused on a single responsibility.
+</Tip>
+
+---
+
+## Retry Strategy Configuration
+
+The retry behaviour is set on the queue builder and applies to all topics:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .with_attempts(5)   // retry up to 5 times before moving to _failed
+            .retry_failed(true) // set to false to skip retries entirely
+    )
+    .build()
+    .await?;
+```
+
+| `RetryStrategy` method | Default | Effect |
+|---|---|---|
+| `.with_attempts(u8)` | `3` | Maximum number of processing attempts |
+| `.retry_failed(bool)` | `true` | `false` moves a rejected message straight to `_failed` without retrying |

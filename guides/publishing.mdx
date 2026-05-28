@@ -1,0 +1,237 @@
+---
+title: "Publishing Messages to a Broccoli Queue"
+sidebarTitle: "Publishing"
+description: "Learn how to publish single messages and batches to Broccoli Queue topics, with options for TTL, priority, delay, and scheduled delivery time."
+---
+
+Publishing in Broccoli Queue means sending a typed, serializable message to a named topic so that one or more consumers can pick it up for processing. Every publish call is async and returns the broker-assigned message metadata — including a `task_id` UUID — so you can trace or correlate messages from the moment they enter the queue.
+
+## The `publish()` Method
+
+`publish()` sends a single message to a topic and returns a `BrokerMessage<T>` containing the assigned `task_id`.
+
+```rust
+pub async fn publish<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    disambiguator: Option<String>,
+    message: &T,
+    options: Option<PublishOptions>,
+) -> Result<BrokerMessage<T>, BroccoliError>
+```
+
+**Parameters**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `topic` | `&str` | Name of the queue / topic to publish to |
+| `disambiguator` | `Option<String>` | Sub-queue key for fairness queues; pass `None` for standard queues |
+| `message` | `&T` | Reference to your payload; `T` must implement `Clone + Serialize + DeserializeOwned` |
+| `options` | `Option<PublishOptions>` | TTL, priority, delay, and scheduled delivery time — `None` uses defaults |
+
+**Basic example**
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmailJob {
+    to: String,
+    subject: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let published = queue
+        .publish(
+            "emails",
+            None,
+            &EmailJob {
+                to: "user@example.com".into(),
+                subject: "Hello".into(),
+            },
+            None,
+        )
+        .await?;
+
+    println!("Published with ID: {}", published.task_id);
+    Ok(())
+}
+```
+
+The returned `BrokerMessage<T>` carries these fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `task_id` | `uuid::Uuid` | Unique identifier assigned by the broker |
+| `payload` | `T` | Your original message payload |
+| `attempts` | `u8` | Number of processing attempts (0 on first publish) |
+| `disambiguator` | `Option<String>` | The disambiguator key, if any |
+
+---
+
+## Batch Publishing with `publish_batch()`
+
+`publish_batch()` accepts any iterator of `T` values and publishes them all in a single broker call, returning a `Vec<BrokerMessage<T>>`.
+
+```rust
+pub async fn publish_batch<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    disambiguator: Option<String>,
+    messages: impl IntoIterator<Item = T>,
+    options: Option<PublishOptions>,
+) -> Result<Vec<BrokerMessage<T>>, BroccoliError>
+```
+
+All messages in the batch share the same `PublishOptions` (TTL, priority, delay, etc.). The following example is taken directly from the `publisher.rs` example — it creates two jobs and publishes them with a 10-second delay:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use serde::{Deserialize, Serialize};
+use time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    let jobs = vec![
+        JobPayload { id: "job-1".into(), task_name: "process_data".into() },
+        JobPayload { id: "job-2".into(), task_name: "generate_report".into() },
+    ];
+
+    let published = queue
+        .publish_batch(
+            "jobs",
+            None,
+            jobs,
+            Some(PublishOptions {
+                delay: Some(Duration::seconds(10)),
+                scheduled_at: None,
+                ttl: None,
+                priority: None,
+            }),
+        )
+        .await?;
+
+    println!(
+        "Published IDs: {:?}",
+        published.iter().map(|j| j.task_id).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+```
+
+---
+
+## `PublishOptions` and `PublishOptionsBuilder`
+
+`PublishOptions` controls four optional delivery behaviours. Use the builder for a fluent, compile-time-checked construction:
+
+```rust
+let opts = PublishOptions::builder()
+    // ... chain setters ...
+    .build();
+```
+
+### Priority
+
+Messages are assigned a priority between **1 (highest)** and **5 (lowest)**. The default is `5`.
+
+```rust
+let opts = PublishOptions::builder()
+    .priority(1)  // deliver before lower-priority messages
+    .build();
+```
+
+<Warning>
+  Calling `.priority()` with a value outside the range `1..=5` will **panic** at runtime. Always validate external priority values before passing them to the builder.
+</Warning>
+
+### Delay
+
+Hold the message invisible for a fixed duration after publishing.
+
+```rust
+use time::Duration;
+
+let opts = PublishOptions::builder()
+    .delay(Duration::seconds(30))
+    .build();
+```
+
+### TTL (Time-to-Live)
+
+Automatically expire and discard the message if it has not been consumed within the given duration.
+
+```rust
+use time::Duration;
+
+let opts = PublishOptions::builder()
+    .ttl(Duration::hours(1))
+    .build();
+```
+
+### Scheduled Delivery Time
+
+Deliver the message at an exact UTC timestamp instead of immediately.
+
+```rust
+use time::{Duration, OffsetDateTime};
+
+let deliver_at = OffsetDateTime::now_utc() + Duration::hours(2);
+
+let opts = PublishOptions::builder()
+    .schedule_at(deliver_at)
+    .build();
+```
+
+<Note>
+  `delay` and `schedule_at` are only honoured when the queue is built with `.enable_scheduling(true)`. If scheduling is disabled (the default), these options are silently ignored and the message is delivered immediately. See the [Scheduling guide](/guides/scheduling) for setup details.
+</Note>
+
+### Combining Options
+
+All four options can be chained together:
+
+```rust
+use time::{Duration, OffsetDateTime};
+
+let opts = PublishOptions::builder()
+    .priority(2)
+    .delay(Duration::minutes(5))
+    .ttl(Duration::hours(24))
+    .build();
+
+queue.publish("jobs", None, &job, Some(opts)).await?;
+```
+
+---
+
+## Return Value and Error Handling
+
+`publish()` returns `Result<BrokerMessage<T>, BroccoliError>`. On success you receive the full broker message including the assigned `task_id`. On failure the error will typically be `BroccoliError::Publish(String)` wrapping the underlying broker or serialization error.
+
+```rust
+match queue.publish("emails", None, &job, None).await {
+    Ok(msg) => println!("Enqueued as {}", msg.task_id),
+    Err(e) => eprintln!("Failed to enqueue: {e}"),
+}
+```
+
+See the [Error Handling guide](/guides/error-handling) for a full breakdown of all `BroccoliError` variants.

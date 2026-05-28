@@ -1,0 +1,180 @@
+---
+title: "BrokerMessage: Typed Message Envelopes in Broccoli"
+sidebarTitle: "Messages"
+description: "Every message in Broccoli Queue is wrapped in a BrokerMessage<T> envelope with a unique task ID, attempt counter, payload, and optional disambiguator for fairness queues."
+---
+
+Every value you publish to or consume from a Broccoli queue is wrapped in a `BrokerMessage<T>` envelope. Rather than passing raw payloads over the wire, Broccoli attaches routing metadata — a unique task ID, an attempt counter, and an optional disambiguator — alongside your typed data. This envelope pattern means handlers always have the context they need to implement idempotency checks, custom backoff logic, or fairness routing without any additional bookkeeping on your side.
+
+## Struct Definition
+
+`BrokerMessage<T>` is defined in `broccoli_queue::brokers::broker` and is the type you interact with in every handler and every consume call:
+
+```rust
+pub struct BrokerMessage<T: Clone> {
+    /// Unique identifier for the message
+    pub task_id: uuid::Uuid,
+    /// The actual message content
+    pub payload: T,
+    /// Number of processing attempts made
+    pub attempts: u8,
+    /// Disambiguator for message fairness routing
+    pub disambiguator: Option<String>,
+}
+```
+
+### Field Reference
+
+<CardGroup cols={2}>
+  <Card title="task_id: uuid::Uuid" icon="fingerprint">
+    An auto-generated UUIDv4 that uniquely identifies this message across the entire system. Use it for idempotency checks, deduplication, or tracing a message through logs.
+  </Card>
+  <Card title="payload: T" icon="box">
+    Your application-defined message data. The type `T` must implement `Clone + serde::Serialize + serde::de::DeserializeOwned` so Broccoli can serialise it to JSON for the wire format and deserialise it back on the consumer side.
+  </Card>
+  <Card title="attempts: u8" icon="arrow-rotate-right">
+    The number of times this message has been processed (or attempted). Starts at `0` on the first delivery and increments each time the message is rejected and re-queued. Inspect this field to implement exponential backoff or to log warnings when a message is being retried.
+  </Card>
+  <Card title="disambiguator: Option&lt;String&gt;" icon="shuffle">
+    An optional routing key used by fairness queues to ensure that messages from different sources are consumed in a round-robin fashion rather than one source starving others. Pass `None` for standard FIFO behaviour.
+  </Card>
+</CardGroup>
+
+## Type Constraints
+
+The generic parameter `T` must satisfy:
+
+```rust
+T: Clone + serde::Serialize + serde::de::DeserializeOwned
+```
+
+- **`Clone`** — Broccoli may need to copy a message for retry or batch operations.
+- **`serde::Serialize`** — The payload is serialised to a JSON string before being written to the broker.
+- **`serde::de::DeserializeOwned`** — The payload is deserialised from JSON when a consumer retrieves the message.
+
+## Defining a Good Message Type
+
+A well-designed message type is a plain data struct deriving the necessary traits. Keep payloads small and serialisable — avoid storing open file handles, channels, or other non-serialisable state:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProcessDataJob {
+    job_id: String,
+    input_url: String,
+    retry_on_failure: bool,
+}
+```
+
+<Tip>
+  Deriving `Debug` is strongly recommended. It costs nothing at runtime and makes log output from `process_messages` dramatically easier to read when a handler fails.
+</Tip>
+
+## How Messages Are Created
+
+You rarely construct `BrokerMessage` yourself. The `publish` and `publish_batch` methods on `BroccoliQueue` call `BrokerMessage::new(payload, disambiguator)` internally:
+
+```rust
+impl<T: Clone + serde::Serialize> BrokerMessage<T> {
+    pub fn new(payload: T, disambiguator: Option<String>) -> Self {
+        Self {
+            task_id: uuid::Uuid::new_v4(),
+            payload,
+            attempts: 0,
+            disambiguator,
+            metadata: None,
+        }
+    }
+}
+```
+
+The `task_id` is generated with `uuid::Uuid::new_v4()`, so every published message gets a globally unique identifier with no coordination required.
+
+## Accessing Message Data in Handlers
+
+When you call `process_messages`, your handler receives a fully deserialised `BrokerMessage<T>`. Access the fields directly:
+
+```rust
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+
+queue.process_messages(
+    "data-processing",
+    None,
+    None,
+    |msg: BrokerMessage<ProcessDataJob>| async move {
+        println!("Task ID:  {}", msg.task_id);
+        println!("Attempt:  {}", msg.attempts);
+        println!("Job ID:   {}", msg.payload.job_id);
+        println!("Input:    {}", msg.payload.input_url);
+        Ok(())
+    },
+).await?;
+```
+
+## Using `attempts` for Custom Retry Logic
+
+The `attempts` counter lets you implement custom behaviour as retries accumulate — for example, escalating log severity or triggering an alert after a threshold:
+
+```rust
+|msg: BrokerMessage<ProcessDataJob>| async move {
+    if msg.attempts >= 3 {
+        eprintln!(
+            "WARNING: task {} has failed {} times. Payload: {:?}",
+            msg.task_id, msg.attempts, msg.payload
+        );
+    }
+
+    // Attempt processing...
+    process(&msg.payload).await?;
+
+    Ok(())
+}
+```
+
+<Note>
+  The `attempts` counter is incremented by the broker each time a message is rejected and re-queued. On the very first delivery, `attempts` is `0`. After the first failure and re-queue it becomes `1`, and so on. Compare `msg.attempts` against your configured `RetryStrategy::with_attempts(n)` value to know how many tries remain.
+</Note>
+
+## Message Lifecycle
+
+Messages move through a well-defined sequence of states from publication to final disposition:
+
+```
+Created (BrokerMessage::new)
+   │
+   ▼
+Published  ──► In Queue (broker stores serialised payload)
+                  │
+                  ▼
+              Consuming (handler receives BrokerMessage<T>)
+                  │
+                  ▼
+              Processing (handler executes)
+                  │
+          ┌───────┴────────┐
+          ▼                ▼
+    Acknowledged      Rejected
+    (removed from    (re-queued or
+     processing       moved to
+     queue)          {topic}_failed)
+```
+
+A message that has been acknowledged is permanently removed from the queue. A rejected message is either put back for another delivery attempt (if `retry_failed` is `true` and `attempts < max_attempts`) or routed to the `{topic}_failed` dead-letter queue.
+
+## The Wire Format: `InternalBrokerMessage`
+
+Internally, Broccoli serialises your `BrokerMessage<T>` into an `InternalBrokerMessage` before writing it to the broker. The payload field becomes a JSON string, and the `task_id` UUID becomes a plain `String`. This type is not part of the public API — you will never construct or receive one directly — but it explains why `T` must be both serialisable and deserialisable:
+
+```rust
+// Internal representation — not exposed to users
+pub struct InternalBrokerMessage {
+    pub task_id: String,
+    pub payload: String,   // JSON-encoded T
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+When a consumer retrieves a message, Broccoli calls `InternalBrokerMessage::into_message::<T>()` which parses the JSON string back into your concrete type and reconstructs the `BrokerMessage<T>` envelope.

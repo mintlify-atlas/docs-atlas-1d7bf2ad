@@ -1,0 +1,167 @@
+---
+title: "BroccoliQueue: The Central Queue Interface Explained"
+sidebarTitle: "Queue"
+description: "BroccoliQueue is the main entry point for publishing and consuming messages. Learn how the builder pattern works and what configuration options are available."
+---
+
+`BroccoliQueue` is the primary API surface of the `broccoli_queue` crate. It acts as a unified facade over whichever broker backend you've configured — Redis, RabbitMQ, or SurrealDB — and exposes a consistent set of async methods for publishing messages, consuming them, processing them with handlers, acknowledging, rejecting, and cancelling. Everything your application needs to interact with a message queue flows through a single `BroccoliQueue` instance.
+
+## Building a Queue
+
+`BroccoliQueue` is constructed with the builder pattern. Call `BroccoliQueue::builder(broker_url)` with a broker connection URL; this returns a `BroccoliQueueBuilder` you can configure fluently before calling `.build().await` to establish the connection.
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(10)
+    .failed_message_retry_strategy(RetryStrategy::new().with_attempts(5))
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+
+### Builder Methods
+
+<Steps>
+  <Step title="pool_connections(n: u8)">
+    Sets the number of connections maintained in the connection pool. Defaults to `10`. Increase this for high-throughput workloads where many tasks publish or consume concurrently.
+
+    ```rust
+    BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(20)
+    ```
+  </Step>
+
+  <Step title="failed_message_retry_strategy(strategy: RetryStrategy)">
+    Configures how the queue handles messages whose handlers return an error. Accepts a [`RetryStrategy`](/concepts/retry-strategy) value that controls the maximum number of attempts and whether failed messages are re-queued or routed directly to the failed queue.
+
+    ```rust
+    use broccoli_queue::queue::RetryStrategy;
+
+    BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(
+            RetryStrategy::new().with_attempts(5)
+        )
+    ```
+  </Step>
+
+  <Step title="enable_scheduling(bool)">
+    Enables or disables delayed and scheduled message delivery. When `true`, you can pass a `delay` or `scheduled_at` field in `PublishOptions` to defer message delivery.
+
+    <Warning>
+      When using RabbitMQ, scheduling requires the [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin to be installed on your broker. Without it, enabling scheduling will not work correctly.
+    </Warning>
+
+    ```rust
+    BroccoliQueue::builder("amqp://guest:guest@localhost:5672/%2f")
+        .enable_scheduling(true)
+    ```
+  </Step>
+
+  <Step title="build() → Result&lt;BroccoliQueue, BroccoliError&gt;">
+    Consumes the builder, connects to the broker, and returns a fully initialised `BroccoliQueue`. This is an `async` method and must be `.await`ed. On failure it returns a `BroccoliError::Broker` variant describing the connection problem.
+
+    ```rust
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+    ```
+  </Step>
+</Steps>
+
+### Connecting with an Existing SurrealDB Instance
+
+When the `surrealdb` feature is enabled you can pass an existing `surrealdb::Surreal` connection rather than a URL string. Use `BroccoliQueue::builder_with(db)` in place of `BroccoliQueue::builder(url)`:
+
+```rust
+#[cfg(feature = "surrealdb")]
+{
+    let db = surrealdb::Surreal::new::<surrealdb::engine::any::Any>("ws://localhost:8000")
+        .await?;
+
+    let queue = BroccoliQueue::builder_with(db)
+        .build()
+        .await?;
+}
+```
+
+<Note>
+  `builder_with` is only compiled when the `surrealdb` Cargo feature is active. For Redis and RabbitMQ always use `BroccoliQueue::builder(url)`.
+</Note>
+
+## Cloning and Sharing
+
+`BroccoliQueue` implements `Clone` via an internal `Arc` around the broker. Cloning is cheap — it only increments a reference count — and both the original and the clone share the same underlying connection pool. This makes it straightforward to pass a queue handle into multiple Tokio tasks:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .build()
+    .await?;
+
+let queue_for_task = queue.clone();
+
+tokio::spawn(async move {
+    queue_for_task.publish("jobs", None, &my_job, None).await.unwrap();
+});
+```
+
+Because the inner broker trait object is `Send + Sync`, `BroccoliQueue` is safe to share across threads and `async` tasks without any additional synchronisation.
+
+## Available Methods
+
+The table below summarises every method available on `BroccoliQueue`. All methods are `async` and must be `.await`ed.
+
+| Method | Description | Returns |
+|--------|-------------|---------|
+| `publish(topic, disambiguator, message, options)` | Publishes a single message to a topic. | `Result<BrokerMessage<T>, BroccoliError>` |
+| `publish_batch(topic, disambiguator, messages, options)` | Publishes an iterator of messages in one call. | `Result<Vec<BrokerMessage<T>>, BroccoliError>` |
+| `consume(topic, options)` | Blocks until a message is available and returns it. Does **not** auto-acknowledge. | `Result<BrokerMessage<T>, BroccoliError>` |
+| `try_consume(topic, options)` | Non-blocking consume. Returns `None` immediately if the queue is empty. | `Result<Option<BrokerMessage<T>>, BroccoliError>` |
+| `consume_batch(topic, batch_size, timeout, options)` | Blocks until `batch_size` messages arrive or `timeout` elapses. | `Result<Vec<BrokerMessage<T>>, BroccoliError>` |
+| `try_consume_batch(topic, batch_size, options)` | Non-blocking batch consume. Returns however many messages are immediately available. | `Result<Vec<BrokerMessage<T>>, BroccoliError>` |
+| `acknowledge(topic, message)` | Marks a message as successfully processed and removes it from the processing queue. | `Result<(), BroccoliError>` |
+| `reject(topic, message)` | Rejects a message — re-queues it or moves it to `{topic}_failed` if retry limit is reached. | `Result<(), BroccoliError>` |
+| `cancel(topic, message_id)` | Deletes a message from the queue by ID without processing it. | `Result<(), BroccoliError>` |
+| `process_messages(topic, concurrency, options, handler)` | Runs a handler function in a loop, consuming and processing messages continuously. | `Result<(), BroccoliError>` |
+| `process_messages_with_handlers(topic, concurrency, options, handler, on_success, on_error)` | Like `process_messages` but with separate success and error callback hooks. | `Result<(), BroccoliError>` |
+| `size(queue_name)` | Returns a map of queue names to their current message counts. | `Result<HashMap<String, u64>, BroccoliError>` |
+| `queue_status(queue_name, disambiguator)` | Returns detailed queue status. Requires the `management` feature flag. | `Result<QueueStatus, BroccoliError>` |
+
+<Tip>
+  For long-running services, prefer `process_messages` or `process_messages_with_handlers` over a manual consume loop. They handle concurrency, error logging, and the acknowledge/reject cycle automatically.
+</Tip>
+
+## PublishOptions
+
+When publishing, you can supply a `PublishOptions` value built with `PublishOptions::builder()` to control delivery behaviour:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `ttl` | `Duration` | Time-to-live for the message. |
+| `priority` | `u8` (1–5) | Message priority; 1 is highest, 5 is lowest. |
+| `delay` | `Duration` | Delay before the message becomes available. Requires `enable_scheduling(true)`. |
+| `scheduled_at` | `OffsetDateTime` | Absolute delivery time. Requires `enable_scheduling(true)`. |
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use time::Duration;
+
+let options = PublishOptions::builder()
+    .delay(Duration::seconds(30))
+    .priority(2)
+    .build();
+
+queue.publish("jobs", None, &my_job, Some(options)).await?;
+```
+
+## ConsumeOptions
+
+Manual consume calls and `process_messages` both accept an optional `ConsumeOptions` value:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `auto_ack` | `bool` | `false` | Automatically acknowledge on consume. Attempting manual ack on an auto-acked message returns an error. |
+| `fairness` | `bool` | `None` | Route via fairness queues (Redis only). |
+| `consume_wait` | `Duration` | `Duration::ZERO` | Sleep duration between tight-loop iterations, allowing Tokio to cancel spawned tasks. |
+| `handler_ack` | `bool` | `true` | If `false`, skips the automatic acknowledge after a successful handler, delegating ack to another actor. |

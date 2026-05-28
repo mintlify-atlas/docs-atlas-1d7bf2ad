@@ -1,0 +1,243 @@
+---
+title: "Broker Backends: Redis, RabbitMQ, and SurrealDB"
+sidebarTitle: "Brokers"
+description: "Broccoli Queue supports three broker backends selectable via Cargo feature flags. Each has different URL schemes, connection models, and capability trade-offs."
+---
+
+Broccoli Queue is designed around a broker abstraction: all three supported backends — Redis, RabbitMQ, and SurrealDB — implement the same `Broker` trait, so your application code never talks directly to any one backend. You configure which backend to use by enabling the corresponding Cargo feature flag and supplying the appropriate connection URL. Everything else — publishing, consuming, acknowledging, retrying — works identically regardless of which broker sits underneath.
+
+## The `Broker` Trait
+
+Every backend implements the following async interface, defined in `broccoli_queue::brokers::broker`:
+
+```rust
+#[async_trait::async_trait]
+pub trait Broker: Send + Sync {
+    async fn connect(&mut self, broker_url: &str) -> Result<(), BroccoliError>;
+
+    async fn publish(
+        &self,
+        queue_name: &str,
+        disambiguator: Option<String>,
+        message: &[InternalBrokerMessage],
+        options: Option<PublishOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+
+    async fn consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<InternalBrokerMessage, BroccoliError>;
+
+    async fn try_consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Option<InternalBrokerMessage>, BroccoliError>;
+
+    async fn try_consume_batch(
+        &self,
+        queue_name: &str,
+        batch_size: usize,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+
+    async fn acknowledge(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    async fn reject(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    async fn cancel(&self, queue_name: &str, message_id: String) -> Result<(), BroccoliError>;
+
+    async fn size(&self, queue_name: &str) -> Result<HashMap<String, u64>, BroccoliError>;
+}
+```
+
+The `Broker` trait is internal to the crate. You interact exclusively through `BroccoliQueue`, which wraps the concrete implementation in an `Arc<Box<dyn Broker>>`.
+
+## URL-Based Broker Routing
+
+When you call `BroccoliQueue::builder(url).build().await`, Broccoli inspects the URL scheme to select the right backend automatically:
+
+| URL prefix | Backend selected |
+|------------|-----------------|
+| `redis://` or `rediss://` | `RedisBroker` |
+| `amqp://` | `RabbitMQBroker` |
+| `ws://` or `mem://` | `SurrealDBBroker` |
+
+Passing an unrecognised scheme returns a `BroccoliError::Broker("Unsupported broker URL scheme")` at build time, so misconfiguration is caught immediately on startup.
+
+## Enabling Backends via Feature Flags
+
+Add features to your `Cargo.toml` to enable the backends you need. The `redis` feature is on by default:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis"] }
+
+# RabbitMQ only:
+broccoli_queue = { version = "0.4.6", default-features = false, features = ["rabbitmq"] }
+
+# SurrealDB only:
+broccoli_queue = { version = "0.4.6", default-features = false, features = ["surrealdb"] }
+
+# All three:
+broccoli_queue = { version = "0.4.6", features = ["redis", "rabbitmq", "surrealdb"] }
+```
+
+## Backend Comparison
+
+| Feature | Redis | RabbitMQ | SurrealDB |
+|---------|-------|----------|-----------|
+| Cargo feature flag | `redis` | `rabbitmq` | `surrealdb` |
+| Connection pool | bb8-redis | deadpool-lapin | Native |
+| Scheduling support | ✅ Yes | ✅ Yes (with plugin) | ✅ Yes |
+| Fairness queues | ✅ Yes | ⚠️ Partial | ❌ No |
+| In-memory mode | ❌ No | ❌ No | ✅ Yes (`mem://`) |
+| Production ready | ✅ Yes | ✅ Yes | ⚠️ Beta |
+| `management` feature | ✅ Supported | ✅ Supported | ❌ Not supported |
+
+## Redis
+
+Redis is the default backend and the recommended choice for most production workloads. It uses [bb8-redis](https://github.com/djc/bb8) for async connection pooling.
+
+**Connection URL format:**
+
+```
+redis://[:password@]host[:port][/db]
+rediss://[:password@]host[:port][/db]   # TLS
+```
+
+**Example:**
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(10)
+    .build()
+    .await?;
+```
+
+**When to choose Redis:**
+- You need a battle-tested, low-latency queue.
+- You want fairness queues (round-robin across disambiguators).
+- You are already running Redis in your infrastructure.
+- You need full support for the `management` feature.
+
+## RabbitMQ
+
+The RabbitMQ backend uses [deadpool-lapin](https://github.com/bikeshedder/deadpool) for pooled AMQP connections via the [lapin](https://github.com/CleverCloud/lapin) client.
+
+**Connection URL format:**
+
+```
+amqp://username:password@host[:port]/vhost
+```
+
+**Example:**
+
+```rust
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672/%2f")
+    .enable_scheduling(true)   // requires the delayed-exchange plugin
+    .build()
+    .await?;
+```
+
+<Warning>
+  Scheduling with RabbitMQ requires the [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin. If the plugin is not installed and you call `enable_scheduling(true)`, message delivery will not behave as expected.
+</Warning>
+
+**When to choose RabbitMQ:**
+- You need AMQP semantics and complex routing topologies.
+- You are operating in an environment where RabbitMQ is already the standard.
+- You need durable, broker-managed queues with rich protocol features.
+
+## SurrealDB
+
+The SurrealDB backend supports both a remote WebSocket connection (`ws://`) and a fully in-process in-memory store (`mem://`), making it uniquely suited for testing and embedded scenarios.
+
+**Connection URL formats:**
+
+```
+ws://host[:port]        # Remote SurrealDB instance over WebSocket
+mem://                  # In-process in-memory database (testing)
+```
+
+**Example — remote:**
+
+```rust
+let queue = BroccoliQueue::builder("ws://localhost:8000")
+    .build()
+    .await?;
+```
+
+**Example — in-memory (great for tests):**
+
+```rust
+let queue = BroccoliQueue::builder("mem://")
+    .build()
+    .await?;
+```
+
+**Example — existing connection (SurrealDB feature only):**
+
+```rust
+use surrealdb::Surreal;
+use surrealdb::engine::any::Any;
+
+let db = Surreal::new::<Any>("ws://localhost:8000").await?;
+db.use_ns("myapp").use_db("queue").await?;
+
+let queue = BroccoliQueue::builder_with(db)
+    .build()
+    .await?;
+```
+
+<Note>
+  SurrealDB's concurrent read behaviour can produce `BroccoliError::BrokerNonIdempotentOp` errors when multiple tasks consume from the same topic simultaneously. The `process_messages` implementation handles these gracefully by logging and continuing.
+</Note>
+
+**When to choose SurrealDB:**
+- You want zero external dependencies in local development or CI (use `mem://`).
+- You are already using SurrealDB and want to reuse an existing connection.
+- You are prototyping and don't need a separate queue infrastructure.
+
+## The `BrokerType` Enum
+
+The internal `BrokerType` enum is used by `connect_to_broker` to dispatch to the right implementation. It is feature-gated so only the enabled variants are compiled:
+
+```rust
+pub enum BrokerType {
+    #[cfg(feature = "redis")]
+    Redis,
+    #[cfg(feature = "rabbitmq")]
+    RabbitMQ,
+    #[cfg(feature = "surrealdb")]
+    SurrealDB,
+}
+```
+
+You do not interact with this type directly — it is an implementation detail of the URL routing logic.
+
+## The `management` Feature
+
+Enabling the `management` Cargo feature unlocks the `QueueManagement` trait, which adds a `queue_status` method to `BroccoliQueue`:
+
+```toml
+broccoli_queue = { version = "0.4.6", features = ["redis", "management"] }
+```
+
+```rust
+#[cfg(feature = "management")]
+let status = queue.queue_status("jobs".to_string(), None).await?;
+```
+
+<Note>
+  The `management` feature is currently supported by Redis and RabbitMQ only. SurrealDB does not implement `BrokerWithManagement`.
+</Note>

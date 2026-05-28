@@ -1,0 +1,197 @@
+---
+title: "Installing Broccoli Queue: Cargo Features and Requirements"
+sidebarTitle: "Installation"
+description: "Add broccoli_queue to your Rust project. Choose from Redis, RabbitMQ, or SurrealDB feature flags and configure Tokio for async runtime support."
+---
+
+Broccoli Queue is distributed as a standard Rust crate on [crates.io](https://crates.io/crates/broccoli_queue). Because it supports multiple broker backends, you select your backend at compile time using Cargo feature flags — only the code and dependencies for the broker you choose are compiled into your binary. You'll also need Tokio as your async runtime and Serde for message serialization.
+
+## Adding Broccoli Queue
+
+Select the tab that matches your message broker. The `redis` feature is enabled by default when you specify just the version string, but the examples below are explicit for clarity.
+
+<Tabs>
+  <Tab title="Redis (default)">
+    Redis is the default backend. It requires a running Redis server and pulls in `bb8-redis` for connection pooling.
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["redis"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+  </Tab>
+  <Tab title="RabbitMQ">
+    The RabbitMQ backend uses `lapin` for the AMQP client and `deadpool-lapin` for connection pooling.
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["rabbitmq"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+
+    <Note>
+      If you want to use message scheduling with RabbitMQ, you must install the [RabbitMQ delayed message exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) and enable scheduling on the queue builder with `.enable_scheduling(true)`.
+    </Note>
+  </Tab>
+  <Tab title="SurrealDB">
+    The SurrealDB backend uses the official `surrealdb` crate. You can connect via WebSocket or use an in-memory engine for testing.
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["surrealdb"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+  </Tab>
+  <Tab title="Multiple backends">
+    You can enable more than one backend in the same binary — useful if you're migrating between brokers or running different queues on different backends.
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["redis", "rabbitmq"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+  </Tab>
+  <Tab title="With management API">
+    The `management` feature unlocks `queue.queue_status()` for inspecting queue depth, in-flight counts, and failed message counts at runtime.
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["redis", "management"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+  </Tab>
+</Tabs>
+
+## Required Dependencies
+
+### Tokio async runtime
+
+Broccoli Queue is built on Tokio. Your binary must include Tokio with the `full` feature set (or at minimum `rt-multi-thread` and `macros`):
+
+```toml
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+```
+
+Annotate your `main` function (or test entry points) with `#[tokio::main]`:
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // your code here
+    Ok(())
+}
+```
+
+### Serde for serialization
+
+All message payloads must implement `serde::Serialize` and `serde::Deserialize`. Enable the `derive` feature so you can use the derive macros:
+
+```toml
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+```
+
+Then annotate your payload structs:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MyJobPayload {
+    id: String,
+    task_name: String,
+}
+```
+
+## Feature Flags Reference
+
+| Feature flag | Description | Dependencies pulled in |
+|---|---|---|
+| `redis` *(default)* | Enables the Redis broker backend | `bb8-redis`, `redis` |
+| `rabbitmq` | Enables the RabbitMQ broker backend via AMQP | `lapin`, `deadpool`, `deadpool-lapin` |
+| `surrealdb` | Enables the SurrealDB broker backend | `surrealdb`, `url` |
+| `management` | Unlocks `queue_status()` and related introspection APIs | `derive_more` |
+| `test-fairness` | Internal test helper for fairness queue testing | *(none)* |
+
+<Warning>
+  At least one of `redis`, `rabbitmq`, or `surrealdb` **must** be enabled. If you attempt to compile with none of these features active, you will receive the following compile error:
+
+  ```
+  error: You must enable at least one of the following features: redis, rabbitmq, surrealdb
+  ```
+</Warning>
+
+## Connection URL Formats
+
+Pass your broker URL as the argument to `BroccoliQueue::builder(url)`. The table below shows the supported formats for each backend.
+
+### Redis
+
+| Format | Description |
+|---|---|
+| `redis://localhost:6379` | Standard unauthenticated local connection |
+| `redis://:password@host:6379` | Password-authenticated connection |
+| `rediss://host:6379` | TLS-encrypted connection (`rediss://` scheme) |
+
+```rust
+// Unauthenticated
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .build().await?;
+
+// With password
+let queue = BroccoliQueue::builder("redis://:mysecret@redis.example.com:6379")
+    .build().await?;
+
+// TLS
+let queue = BroccoliQueue::builder("rediss://redis.example.com:6379")
+    .build().await?;
+```
+
+### RabbitMQ
+
+| Format | Description |
+|---|---|
+| `amqp://guest:guest@localhost:5672` | Standard local connection with default credentials |
+| `amqp://user:pass@host:5672/vhost` | Custom credentials and virtual host |
+
+```rust
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+    .build().await?;
+```
+
+### SurrealDB
+
+| Format | Description |
+|---|---|
+| `ws://localhost:8000/?ns=myns&db=mydb` | WebSocket connection with namespace and database |
+| `mem://` | In-memory engine, ideal for tests |
+
+```rust
+// WebSocket
+let queue = BroccoliQueue::builder("ws://localhost:8000/?ns=myns&db=mydb")
+    .build().await?;
+
+// In-memory (great for integration tests)
+let queue = BroccoliQueue::builder("mem://")
+    .build().await?;
+```
+
+<Tip>
+  When using SurrealDB, you can also pass an existing `surrealdb::Surreal` connection directly to avoid creating a second connection. Use `BroccoliQueue::builder_with(db)` instead of `BroccoliQueue::builder(url)`. This is only available when the `surrealdb` feature is enabled.
+</Tip>
+
+## Verifying Your Setup
+
+After adding the dependencies, run `cargo build` to confirm everything resolves correctly:
+
+```bash
+cargo build
+```
+
+Then move on to the [Quickstart](/quickstart) to publish and consume your first message.

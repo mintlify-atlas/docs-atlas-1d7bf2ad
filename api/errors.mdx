@@ -1,0 +1,203 @@
+---
+title: "BroccoliError — Error Types Reference for Broccoli Queue"
+sidebarTitle: "Errors"
+description: "Complete reference for all BroccoliError variants returned by Broccoli Queue operations, including broker errors, publish/consume failures, and feature-gated errors."
+---
+
+`BroccoliError` is the unified error type returned by every fallible operation in Broccoli Queue. It is derived with [`thiserror`](https://docs.rs/thiserror), so each variant carries a human-readable `Display` message and implements `std::error::Error`. Feature-gated variants (Redis, SurrealDB) are only compiled in when their respective Cargo feature flags are enabled. All public methods on `BroccoliQueue` return `Result<_, BroccoliError>`, and handler closures are expected to return `Result<(), BroccoliError>` so that the library can automatically acknowledge or reject messages.
+
+## Variants
+
+### `Broker(String)`
+
+General broker error covering connection failures, pool initialization problems, and other transport-level issues that do not fit a more specific category.
+
+**When it occurs:** Connection to the broker fails during `build()`, the connection pool cannot be created, or a low-level broker operation returns an unclassified error.
+
+**How to handle:** Check the string for the underlying cause. Consider retrying `BroccoliQueue::builder(...).build()` with exponential back-off, or surface the error to your health-check endpoint.
+
+---
+
+### `BrokerNonIdempotentOp(String)`
+
+A concurrent SurrealDB read conflict where two workers raced to consume the same message and the operation cannot be retried safely.
+
+**When it occurs:** Only with the SurrealDB broker when multiple parallel consumers read from the same topic simultaneously.
+
+**How to handle:** This error is not retryable. `process_messages` logs it as a warning and moves on to the next iteration. If you see it frequently, reduce consumer concurrency or switch to a broker with native at-most-once delivery semantics.
+
+---
+
+### `BrokerNonIdempotentRetriableOp(String)`
+
+A concurrent SurrealDB write conflict where the operation can be safely retried.
+
+**When it occurs:** Only with the SurrealDB broker when multiple consumers write to the same table concurrently.
+
+**How to handle:** Retry the operation. The library retries automatically in `process_messages`; in manual consume/acknowledge loops, catch this variant and retry the offending call.
+
+---
+
+### `Publish(String)`
+
+The message could not be sent to the broker or the payload could not be serialized.
+
+**When it occurs:** `BroccoliQueue::publish` or `BroccoliQueue::publish_batch` fails — for example, the broker connection is down at publish time, or `serde_json` cannot serialize the payload type.
+
+**How to handle:** Inspect the string for a serialization error vs. a network error. For transient network errors, retry with back-off. For serialization errors, the payload type likely contains a non-serializable field.
+
+---
+
+### `Consume(String)`
+
+A message could not be retrieved from the broker or the wire payload could not be deserialized into the target type `T`.
+
+**When it occurs:** `BroccoliQueue::consume`, `try_consume`, `consume_batch`, or `try_consume_batch` fails. Also returned when `InternalBrokerMessage::into_message::<T>()` cannot parse the stored JSON.
+
+**How to handle:** A deserialization failure usually means the message was published with a different schema. Check for schema drift between publishers and consumers. A network error warrants a retry.
+
+---
+
+### `Acknowledge(String)`
+
+The broker could not remove the message from the processing queue after the handler returned `Ok`.
+
+**When it occurs:** `BroccoliQueue::acknowledge` fails. The message remains in the processing queue and will be re-delivered after the visibility timeout.
+
+**How to handle:** Log the error. The message will be reprocessed, so your handler must be idempotent. If acknowledgment fails repeatedly, investigate broker connectivity.
+
+---
+
+### `Reject(String)`
+
+The broker could not move the message to the failed queue after the handler returned `Err`.
+
+**When it occurs:** `BroccoliQueue::reject` fails. The message stays in the processing queue.
+
+**How to handle:** Log the error. The message will eventually be re-delivered. Ensure your handler remains idempotent to handle duplicate deliveries safely.
+
+---
+
+### `Cancel(String)`
+
+The broker could not remove the message from the queue without processing it.
+
+**When it occurs:** `BroccoliQueue::cancel` fails.
+
+**How to handle:** Retry the cancel call. If the queue backend is temporarily unavailable, the message will remain and may be delivered to a consumer.
+
+---
+
+### `GetMessagePosition(String)`
+
+The message's position in the queue could not be retrieved.
+
+**When it occurs:** The position query fails at the broker level.
+
+**How to handle:** Note that this operation is not implemented for the RabbitMQ broker — calling it against RabbitMQ will return `BroccoliError::NotImplemented` instead.
+
+---
+
+### `Serialization(serde_json::Error)`
+
+A JSON serialization or deserialization failure. This variant is produced via `#[from]` so `serde_json::Error` converts automatically into `BroccoliError`.
+
+**When it occurs:** The payload cannot be serialized to JSON on publish, or the stored JSON string cannot be parsed back into `T` on consume.
+
+**How to handle:** Inspect the wrapped `serde_json::Error` for the exact field or position that failed. Ensure that both the publisher and consumer agree on the schema of `T`.
+
+---
+
+### `Redis(redis::RedisError)` *(redis feature)*
+
+A Redis-specific transport or protocol error, produced via `#[from]` on `redis::RedisError`. Only compiled when the `redis` feature flag is enabled.
+
+**When it occurs:** Any underlying Redis command fails — authentication errors, RESP protocol violations, network timeouts, or cluster redirection failures.
+
+**How to handle:** Check the wrapped `redis::RedisError` for error kind and detail. Connection errors typically warrant a reconnect; command errors may indicate a misconfiguration.
+
+---
+
+### `SurrealDB(surrealdb::Error)` *(surrealdb feature)*
+
+A SurrealDB-specific error, produced via `#[from]` on `surrealdb::Error`. Only compiled when the `surrealdb` feature flag is enabled.
+
+**When it occurs:** Any SurrealDB query, connection, or authentication operation fails.
+
+**How to handle:** Inspect the wrapped `surrealdb::Error`. Authentication and schema errors are usually configuration issues; network errors warrant a retry.
+
+---
+
+### `Job(String)`
+
+A general job processing error. This is the recommended variant to return from your handler closures when application-level work fails.
+
+**When it occurs:** Your handler closure returns `Err(BroccoliError::Job(...))`. The library treats this as a processing failure and calls `reject` on the message.
+
+**How to handle:** Wrap application errors with `BroccoliError::Job(e.to_string())` in handlers. The broker will retry the message up to `retry_attempts` times before moving it to the failed queue.
+
+---
+
+### `QueueStatus(String)`
+
+An error retrieving queue status via the management API.
+
+**When it occurs:** `BroccoliQueue::queue_status` fails — for example, the broker cannot enumerate queue sizes or the management feature query returns an error.
+
+**How to handle:** Log the error and retry. If the queue backend is healthy but the error persists, check that the `management` feature is enabled and that the broker type supports it.
+
+---
+
+### `ConnectionTimeout(u32)`
+
+The broker connection attempt timed out. The `u32` value is the number of retry attempts made before giving up.
+
+**When it occurs:** The broker is unreachable and all reconnection attempts were exhausted.
+
+**How to handle:** Check broker availability and network routing. The `u32` tells you how many retries were attempted, which is useful for alerting and diagnostics.
+
+---
+
+### `NotImplemented`
+
+The requested feature is not implemented for the current broker backend.
+
+**When it occurs:** For example, calling `GetMessagePosition` against the RabbitMQ broker.
+
+**How to handle:** Switch to a supported broker for the required feature, or remove the unsupported call. Check the per-broker documentation for capability matrices.
+
+---
+
+## Pattern Matching Example
+
+Handle specific error conditions explicitly and fall back to a catch-all for unexpected errors:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+match queue.consume::<MyJob>("jobs", None).await {
+    Ok(msg) => { /* process */ }
+    Err(BroccoliError::Consume(e)) => eprintln!("Consume failed: {}", e),
+    Err(BroccoliError::ConnectionTimeout(retries)) => {
+        eprintln!("Timed out after {} retries", retries);
+    }
+    Err(BroccoliError::NotImplemented) => {
+        eprintln!("Feature not supported by this broker");
+    }
+    Err(e) => eprintln!("Error: {:?}", e),
+}
+```
+
+## Using `BroccoliError` as a Handler Return Type
+
+Handler closures passed to `process_messages` must return `Result<(), BroccoliError>`. Use `BroccoliError::Job` to wrap application-level errors:
+
+```rust
+|msg: BrokerMessage<MyJob>| async move {
+    do_work(msg.payload)
+        .await
+        .map_err(|e| BroccoliError::Job(e.to_string()))
+}
+```
+
+When the handler returns `Err`, the library automatically calls `reject` on the message, incrementing its attempt counter and eventually dead-lettering it to the failed queue after the configured number of retries.

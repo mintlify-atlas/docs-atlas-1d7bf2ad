@@ -1,0 +1,235 @@
+---
+title: "RabbitMQ Broker: AMQP Backend for Broccoli Queue"
+sidebarTitle: "RabbitMQ"
+description: "Use RabbitMQ as the message broker for Broccoli Queue over AMQP. Supports connection pooling via deadpool-lapin, priority queues, and message scheduling with a plugin."
+---
+
+RabbitMQ is the AMQP-based backend for Broccoli Queue, powered by the [lapin](https://crates.io/crates/lapin) async AMQP client and managed by [deadpool-lapin](https://crates.io/crates/deadpool-lapin) for connection pooling. It is a good choice for teams already operating a RabbitMQ cluster who want to add async task processing with familiar AMQP semantics — durable queues, per-message acknowledgment, and priority routing — without running an additional Redis instance.
+
+## Installation
+
+Enable the `rabbitmq` feature in your `Cargo.toml`:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["rabbitmq"] }
+```
+
+<Note>
+  The `redis` feature is enabled by default. If you only want RabbitMQ, use `default-features = false`:
+
+  ```toml
+  broccoli_queue = { version = "0.4.6", default-features = false, features = ["rabbitmq"] }
+  ```
+</Note>
+
+## Connection URL Format
+
+RabbitMQ connections use standard AMQP URIs:
+
+```
+amqp://guest:guest@localhost:5672
+```
+
+The URL is passed directly to `deadpool-lapin`, which supports the full AMQP URI spec including virtual hosts (`amqp://user:pass@host:5672/vhost`) and TLS (`amqps://...`).
+
+## Connection Pool
+
+The RabbitMQ broker uses [deadpool-lapin](https://crates.io/crates/deadpool-lapin) with a **FIFO queue mode** (`QueueMode::Fifo`) to ensure connections are reused in order. Pool configuration:
+
+| Option | Default | Description |
+|---|---|---|
+| `pool_connections(n)` | `10` | Maximum pooled AMQP connections |
+| Wait timeout | `2 seconds` | How long to wait for a free connection |
+| Create timeout | `2 seconds` | How long to allow a new connection to open |
+| Recycle timeout | `2 seconds` | How long to allow recycling a connection |
+
+## Full Setup Example
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+        .pool_connections(10)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+## Local Development
+
+<Tabs>
+  <Tab title="Standard RabbitMQ">
+    Start a RabbitMQ instance with the management plugin:
+
+    ```bash
+    docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+    ```
+
+    The management UI is then available at [http://localhost:15672](http://localhost:15672)  
+    Default credentials: **guest / guest**
+  </Tab>
+  <Tab title="With Scheduling Plugin">
+    Use the custom `Dockerfile.rabbitmq` from the Broccoli repository to build an image with the delayed-message-exchange plugin pre-installed:
+
+    ```dockerfile
+    FROM rabbitmq:4.0.9-management
+
+    # Install wget if not present
+    USER root
+    RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
+
+    # Download and install the delayed message exchange plugin
+    RUN wget https://github.com/rabbitmq/rabbitmq-delayed-message-exchange/releases/download/v4.0.7/rabbitmq_delayed_message_exchange-v4.0.7.ez \
+        -O /opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-v4.0.7.ez
+
+    # Set proper permissions
+    RUN chown rabbitmq:rabbitmq /opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-v4.0.7.ez && \
+        chmod 644 /opt/rabbitmq/plugins/rabbitmq_delayed_message_exchange-v4.0.7.ez
+
+    # Enable the plugin
+    RUN rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+
+    # Set proper permissions for cookie file
+    RUN mkdir -p /var/lib/rabbitmq && \
+        chown -R rabbitmq:rabbitmq /var/lib/rabbitmq && \
+        chmod 700 /var/lib/rabbitmq
+
+    USER rabbitmq
+    ```
+
+    Build and run it:
+
+    ```bash
+    docker build -f Dockerfile.rabbitmq -t broccoli-rabbitmq .
+    docker run -d -p 5672:5672 -p 15672:15672 broccoli-rabbitmq
+    ```
+  </Tab>
+</Tabs>
+
+## AMQP Queue Declarations
+
+On first use, Broccoli declares each queue as **durable** so messages survive broker restarts. The broker also declares a `broccoli` exchange during `connect()` — all messages are published through this exchange and routed to the target queue by name.
+
+```rust
+// Queue declaration happens automatically; durable = true is always set
+self.setup_queue(&channel, queue_name).await?;
+```
+
+## Channel Management
+
+Each `consume` call creates a fresh AMQP channel from the pool connection. When a message is consumed without `auto_ack`, the channel is stored in an internal `DashMap<String, Channel>` keyed by `task_id` so that `acknowledge` and `reject` can look it up later.
+
+```
+consume() ──► basic_get / basic_consume
+                │
+          (no auto_ack)
+                │
+                ▼
+       consume_channels[task_id] = channel
+                │
+      (acknowledge / reject)
+                │
+                ▼
+       channel.basic_ack / basic_reject
+       consume_channels.remove(task_id)
+```
+
+## Priority Queues
+
+RabbitMQ priority is set via the AMQP `BasicProperties::with_priority` field. Broccoli inverts the 1–5 scale so that priority `1` (highest in Broccoli terms) maps to the highest AMQP priority value (`5 - priority`):
+
+| Broccoli Priority | AMQP Priority Byte |
+|---|---|
+| 1 (highest) | 4 |
+| 5 (default/lowest) | 0 |
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+
+queue.publish_with_options(
+    "my-queue",
+    &my_message,
+    PublishOptions {
+        priority: Some(1), // highest priority
+        ..Default::default()
+    },
+).await?;
+```
+
+## Scheduling
+
+<Warning>
+  RabbitMQ does **not** support scheduling natively. Message scheduling requires the [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin to be installed and enabled on your broker. See the **With Scheduling Plugin** tab above for setup instructions.
+</Warning>
+
+Once the plugin is installed, enable scheduling on the queue builder and publish with `delay` or `scheduled_at`:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use std::time::Duration;
+
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+    .enable_scheduling(true)
+    .build()
+    .await?;
+
+// Delay by 60 seconds using the x-delay AMQP header
+queue.publish_with_options(
+    "my-queue",
+    &my_message,
+    PublishOptions {
+        delay: Some(Duration::from_secs(60)),
+        ..Default::default()
+    },
+).await?;
+```
+
+Under the hood, Broccoli sets the `x-delay` AMQP header (in milliseconds) in the message's `FieldTable`:
+
+- `delay` → `x-delay = delay.whole_milliseconds()`
+- `scheduled_at` → `x-delay = (scheduled_at - now).whole_milliseconds()`
+
+## Message Acknowledgment
+
+Broccoli uses explicit acknowledgment by default:
+
+| Operation | AMQP Primitive |
+|---|---|
+| `acknowledge()` | `basic_ack` with `BasicAckOptions::default()` |
+| `reject()` | `basic_reject` with `BasicRejectOptions::default()`, then re-publishes if `attempts < 3` |
+
+## Limitations
+
+<CardGroup cols={2}>
+  <Card title="No cancel() support" icon="ban">
+    `cancel()` returns `BroccoliError::NotImplemented`. There is no way to remove a specific in-flight or queued message by ID via AMQP without external tooling.
+  </Card>
+  <Card title="No size() support" icon="chart-bar">
+    `size()` returns `BroccoliError::NotImplemented`. Use the RabbitMQ management UI or HTTP API to inspect queue depth.
+  </Card>
+  <Card title="No fairness queues" icon="scale-balanced">
+    Fairness / disambiguator-based routing is not implemented for RabbitMQ. The `disambiguator` parameter is accepted but ignored.
+  </Card>
+  <Card title="Scheduling requires plugin" icon="clock">
+    Unlike the Redis broker, scheduling requires a custom RabbitMQ build with the delayed-message-exchange plugin. See the setup instructions above.
+  </Card>
+</CardGroup>
+
+## Supported Features
+
+| Feature | Supported |
+|---|---|
+| Priority queues | ✅ |
+| Durable queues | ✅ |
+| Message TTL | ✅ (via AMQP `expiration` property) |
+| Scheduling (`delay` / `scheduled_at`) | ✅ (requires delayed-message-exchange plugin) |
+| Fairness queues | ❌ |
+| `cancel()` | ❌ |
+| `size()` | ❌ |
+| Management API | ✅ (requires `management` feature) |

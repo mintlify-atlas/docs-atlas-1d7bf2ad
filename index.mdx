@@ -1,24 +1,117 @@
 ---
-title: "Introduction"
-description: "Welcome to your Mintlify project"
+title: "Broccoli Queue: Async Message Queue for Rust"
+sidebarTitle: "Home"
+description: "Broccoli Queue is a robust, type-safe async message queue library for Rust applications. Supports Redis, RabbitMQ, and SurrealDB backends with configurable retry strategies."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+Broccoli Queue is a production-ready message queue library for Rust, designed as a type-safe alternative to Celery. It provides a unified async API over Redis, RabbitMQ, and SurrealDB backends — letting you publish, consume, and process jobs with full control over retries, scheduling, and concurrency.
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages. This card links to the components overview in the Mintlify documentation with information about every available component.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first producer and consumer in under five minutes
+  </Card>
+  <Card title="Installation" icon="box" href="/installation">
+    Add Broccoli Queue to your Cargo.toml and choose a broker backend
+  </Card>
+  <Card title="Core Concepts" icon="lightbulb" href="/concepts/queue">
+    Understand queues, messages, brokers, and retry strategies
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/broccoli-queue">
+    Full reference for BroccoliQueue, PublishOptions, ConsumeOptions, and more
+  </Card>
+</CardGroup>
 
-  Edit this card to link to a different page in your project when you add more content.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file. This card links to the settings overview page in the Mintlify documentation with information about how to configure your project.
+## Why Broccoli Queue?
 
-  Edit this card to link to a different page in your project when you add more content.
-</Card>
+Broccoli Queue brings Celery-style distributed job processing to Rust without sacrificing type safety or performance. Every message is generically typed and serialized with Serde — no stringly-typed payloads.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Multiple Backends" icon="database" href="/concepts/brokers">
+    Redis, RabbitMQ, and SurrealDB — switchable via Cargo feature flags
+  </Card>
+  <Card title="Scheduling" icon="clock" href="/guides/scheduling">
+    Delay messages or schedule them at an exact timestamp
+  </Card>
+  <Card title="Fairness Queues" icon="scale-balanced" href="/guides/fairness">
+    Round-robin consumption with per-tenant disambiguators
+  </Card>
+  <Card title="Retry Strategies" icon="rotate" href="/concepts/retry-strategy">
+    Configurable retry attempts and failed-message routing
+  </Card>
+</CardGroup>
+
+## Get Started in Minutes
+
+<Steps>
+  <Step title="Add the dependency">
+    Add `broccoli_queue` to your `Cargo.toml` with the broker feature you need:
+
+    ```toml Cargo.toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["redis"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
+    ```
+  </Step>
+  <Step title="Define your message type">
+    Create a serializable struct representing your job payload:
+
+    ```rust
+    use serde::{Serialize, Deserialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct EmailJob {
+        to: String,
+        subject: String,
+    }
+    ```
+  </Step>
+  <Step title="Publish a message">
+    Build a queue and publish your first job:
+
+    ```rust
+    use broccoli_queue::queue::BroccoliQueue;
+
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    queue.publish("emails", None, &EmailJob {
+        to: "user@example.com".into(),
+        subject: "Welcome!".into(),
+    }, None).await?;
+    ```
+  </Step>
+  <Step title="Consume and process">
+    Subscribe to the queue and process messages with a typed handler:
+
+    ```rust
+    use broccoli_queue::brokers::broker::BrokerMessage;
+
+    queue.process_messages(
+        "emails",
+        Some(4), // 4 concurrent workers
+        None,
+        |msg: BrokerMessage<EmailJob>| async move {
+            println!("Sending email to: {}", msg.payload.to);
+            Ok(())
+        },
+    ).await?;
+    ```
+  </Step>
+</Steps>
+
+## Broker Backends
+
+<CardGroup cols={3}>
+  <Card title="Redis" icon="database" href="/brokers/redis">
+    Default backend. Fast, battle-tested, supports scheduling and fairness queues.
+  </Card>
+  <Card title="RabbitMQ" icon="rabbit" href="/brokers/rabbitmq">
+    AMQP-based backend with native message acknowledgment and channel pooling.
+  </Card>
+  <Card title="SurrealDB" icon="circle-nodes" href="/brokers/surrealdb">
+    Embedded or remote backend — ideal for testing or single-process deployments.
+  </Card>
+</CardGroup>

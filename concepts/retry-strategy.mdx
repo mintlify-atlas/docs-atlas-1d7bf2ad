@@ -1,0 +1,173 @@
+---
+title: "Retry Strategies: Handling Failed Messages in Broccoli"
+sidebarTitle: "Retry Strategy"
+description: "Configure how Broccoli Queue handles failed messages with RetryStrategy. Set maximum attempts, enable or disable retries, and control routing to failed queues."
+---
+
+When a message handler returns `Err(_)`, Broccoli Queue does not silently drop the message. Instead it calls `reject` on the broker, which either re-queues the message for another delivery attempt or routes it to a dead-letter queue named `{topic}_failed`. The exact behaviour is governed by a `RetryStrategy` you configure on the queue builder. Getting this right is essential for building robust workers that survive transient failures without losing messages.
+
+## What Happens on Failure
+
+When `process_messages` or `process_messages_with_handlers` receives an `Err` from a handler, the message is passed to the broker's `reject` method. The broker then checks the message's `attempts` counter against the configured maximum:
+
+- **Attempts remaining** — the message is re-queued with an incremented `attempts` counter and will be delivered again.
+- **Attempts exhausted** — the message is moved to the `{topic}_failed` queue where it can be inspected, replayed, or discarded.
+- **Retries disabled** — regardless of `attempts`, the message is immediately moved to `{topic}_failed` with no second chance.
+
+## The `RetryStrategy` Struct
+
+`RetryStrategy` is a simple configuration struct with two fields:
+
+```rust
+pub struct RetryStrategy {
+    /// If true, failed messages are re-queued; if false, they go directly to the failed queue
+    pub retry_failed: bool,
+    /// Maximum number of retry attempts; defaults to 3 when None
+    pub attempts: Option<u8>,
+}
+```
+
+## Building a Retry Strategy
+
+<Steps>
+  <Step title="RetryStrategy::new() / RetryStrategy::default()">
+    Both produce the same default configuration: retries enabled, maximum of 3 attempts. `new()` is a `const fn` so it can be used in static contexts.
+
+    ```rust
+    use broccoli_queue::queue::RetryStrategy;
+
+    // These are equivalent
+    let strategy = RetryStrategy::new();
+    let strategy = RetryStrategy::default();
+    ```
+  </Step>
+
+  <Step title=".with_attempts(n: u8)">
+    Override the default attempt limit. The value represents the total maximum number of times the message will be tried — including the first delivery.
+
+    ```rust
+    // Allow up to 5 delivery attempts before moving to the failed queue
+    let strategy = RetryStrategy::new().with_attempts(5);
+    ```
+  </Step>
+
+  <Step title=".retry_failed(bool)">
+    Control whether failed messages are ever re-queued. Passing `false` causes every failing message to be immediately moved to `{topic}_failed`, regardless of how many attempts have been made.
+
+    ```rust
+    // No retries — failures go directly to the failed queue
+    let strategy = RetryStrategy::new().retry_failed(false);
+    ```
+  </Step>
+</Steps>
+
+## Code Examples
+
+```rust
+use broccoli_queue::queue::RetryStrategy;
+
+// Default: 3 attempts, retries enabled
+let strategy = RetryStrategy::default();
+
+// Custom: 5 attempts, retries enabled
+let strategy = RetryStrategy::new().with_attempts(5);
+
+// Disable retries: failed messages go directly to the failed queue
+let strategy = RetryStrategy::new().retry_failed(false);
+
+// Zero-tolerance: immediate failure routing, single attempt cap
+let strategy = RetryStrategy::new()
+    .with_attempts(1)
+    .retry_failed(false);
+```
+
+## Configuring on the Queue
+
+Pass your `RetryStrategy` to the queue builder via `failed_message_retry_strategy`:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new().with_attempts(5)
+    )
+    .build()
+    .await?;
+```
+
+<Note>
+  The retry strategy is applied globally to all topics processed by this `BroccoliQueue` instance. If you need different retry behaviour per topic, create separate `BroccoliQueue` instances with different configurations.
+</Note>
+
+## What Happens at Maximum Retries
+
+Once a message's `attempts` counter reaches the configured maximum, the broker stops re-queuing it and moves it to a dead-letter queue named after the original topic with a `_failed` suffix:
+
+```
+Original topic:  "data-processing"
+Failed queue:    "data-processing_failed"
+```
+
+Messages in the failed queue are not consumed by `process_messages` — they sit there until you explicitly consume and inspect them, replay them, or delete them. This gives you a durable audit trail of every message that could not be processed successfully.
+
+## Using `attempts` for Custom Backoff
+
+The `attempts` field on `BrokerMessage<T>` lets you implement your own backoff logic inside a handler. For example, you can add an increasing delay before re-raising an error:
+
+```rust
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use std::time::Duration;
+
+|msg: BrokerMessage<MyJob>| async move {
+    // Exponential wait proportional to attempt number
+    if msg.attempts > 0 {
+        let backoff = Duration::from_secs(2u64.pow(msg.attempts as u32));
+        tokio::time::sleep(backoff).await;
+    }
+
+    do_work(&msg.payload).await.map_err(|e| {
+        BroccoliError::Job(format!("Job {} failed: {e}", msg.task_id))
+    })
+}
+```
+
+<Tip>
+  Combine `msg.attempts` with your configured attempt ceiling to decide whether to perform expensive recovery operations only on the final attempt, avoiding unnecessary work on earlier retries.
+</Tip>
+
+## Manual Acknowledgement with `handler_ack`
+
+By default, `process_messages` automatically acknowledges a message after a successful handler and rejects it after a failure. Setting `handler_ack` to `false` in `ConsumeOptions` disables the automatic acknowledge step after success, giving you full manual control:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions};
+use broccoli_queue::brokers::broker::BrokerMessage;
+
+let options = ConsumeOptions::builder()
+    .handler_ack(false)
+    .build();
+
+queue.process_messages(
+    "jobs",
+    None,
+    Some(options),
+    |msg: BrokerMessage<MyJob>| async move {
+        // Spawn a long-running task and return immediately.
+        // The spawned task is responsible for calling queue.acknowledge() when done.
+        tokio::spawn(async move {
+            do_long_work(msg).await;
+        });
+        Ok(())
+    },
+).await?;
+```
+
+<Note>
+  Handler errors **always** trigger a reject, even when `handler_ack` is `false`. The `handler_ack` flag only suppresses the automatic acknowledge on success — it does not affect the failure path.
+</Note>
+
+<Warning>
+  Disabling retries with `RetryStrategy::new().retry_failed(false)` means every single handler error immediately routes the message to `{topic}_failed` with no second chance. Use this only when your processing is fully idempotent and a message that fails once is certain to fail again — for example, when the payload itself is invalid and re-processing would always produce the same error.
+</Warning>

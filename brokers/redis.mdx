@@ -1,0 +1,243 @@
+---
+title: "Redis Broker: Setup and Configuration for Broccoli Queue"
+sidebarTitle: "Redis"
+description: "Use Redis as the message broker for Broccoli Queue. Supports connection pooling via bb8, message scheduling, fairness queues, and priority-based routing."
+---
+
+Redis is the default and most feature-rich backend for Broccoli Queue. It uses a connection pool backed by [bb8-redis](https://crates.io/crates/bb8-redis) and leverages Redis sorted sets, hashes, and Lua scripts to provide reliable message delivery, priority ordering, fairness queues, and optional scheduling — all without an external scheduler process.
+
+## Installation
+
+Because `redis` is the default feature, you can depend on `broccoli_queue` with no extra flags:
+
+```toml
+[dependencies]
+broccoli_queue = "0.4.6"
+```
+
+To be explicit, or to combine with other features:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis"] }
+```
+
+## Connection URL Formats
+
+<CardGroup cols={2}>
+  <Card title="Basic" icon="circle-dot">
+    ```
+    redis://localhost:6379
+    ```
+  </Card>
+  <Card title="With Password" icon="lock">
+    ```
+    redis://:password@localhost:6379
+    ```
+  </Card>
+  <Card title="TLS (rediss)" icon="shield-halved">
+    ```
+    rediss://hostname:6379
+    ```
+  </Card>
+  <Card title="Specific Database" icon="database">
+    ```
+    redis://localhost:6379/1
+    ```
+  </Card>
+</CardGroup>
+
+## Connection Pool
+
+The Redis broker uses [bb8](https://crates.io/crates/bb8) for async connection pooling. The pool is configured when building the queue:
+
+| Option | Default | Description |
+|---|---|---|
+| `pool_connections(n)` | `10` | Maximum number of pooled connections |
+| Connection timeout | `2 seconds` | Per-connection attempt timeout |
+
+If a connection cannot be obtained, the broker retries with exponential backoff (starting at 1 second, capping at 5 minutes) and automatically rebuilds the pool on failure.
+
+## Full Setup Example
+
+```rust
+use broccoli_queue::{
+    brokers::broker::BrokerConfig,
+    queue::{BroccoliQueue, RetryStrategy},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(20)
+        .failed_message_retry_strategy(
+            RetryStrategy::new().with_attempts(5)
+        )
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+## Local Development
+
+Start a local Redis instance with Docker:
+
+```bash
+docker run -d -p 6379:6379 redis:7-alpine
+```
+
+## Internal Data Model
+
+Understanding how Broccoli stores data in Redis can help when debugging or inspecting queue state directly.
+
+<Steps>
+  <Step title="Message Storage">
+    Each message is stored as a **Redis Hash** keyed by `task_id`. The hash contains the following fields:
+
+    | Field | Description |
+    |---|---|
+    | `task_id` | Unique message identifier (UUID) |
+    | `payload` | Serialized message content |
+    | `attempts` | Number of processing attempts made |
+    | `priority` | Priority level (1–5; 1 is highest) |
+    | `disambiguator` | Fairness queue discriminator (optional) |
+  </Step>
+
+  <Step title="Queue Sorted Sets">
+    Messages are enqueued into **Redis sorted sets** (ZADD) where the score determines processing order:
+
+    - **Normal queue**: `{queue_name}` — score is `priority × timestamp_nanos`
+    - **Processing queue**: `{queue_name}_processing` — in-flight messages awaiting acknowledgment
+    - **Failed queue**: `{queue_name}_failed` — messages that exhausted all retry attempts
+    - **Fairness sub-queue**: `{queue_name}_{disambiguator}_queue` — per-disambiguator sorted set
+  </Step>
+
+  <Step title="Atomic Dequeue">
+    Consume operations use **Lua scripts** executed atomically on the Redis server. The script pops the lowest-score entry with `ZPOPMIN`, checks whether the score is in the future (scheduled message), and pushes the task ID into the processing list — all in a single round-trip.
+  </Step>
+</Steps>
+
+## Priority Queues
+
+Broccoli Queue supports five priority levels for Redis messages. Priority is applied as a multiplier on the nanosecond timestamp score:
+
+```
+score = priority × unix_timestamp_nanos
+```
+
+| Priority | Value | Behavior |
+|---|---|---|
+| Highest | `1` | Smallest score — dequeued first |
+| Default | `5` | Standard FIFO ordering |
+| Lowest | `5` | Largest score — dequeued last |
+
+<Note>
+  Priority values must be between **1** (highest) and **5** (lowest, default). Passing a value outside this range returns a `BroccoliError::Broker` error.
+</Note>
+
+Publish a message with explicit priority:
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+
+queue.publish_with_options(
+    "my-queue",
+    &my_message,
+    PublishOptions {
+        priority: Some(1), // highest priority
+        ..Default::default()
+    },
+).await?;
+```
+
+## Fairness Queues
+
+Fairness queues distribute work evenly across multiple producers identified by a **disambiguator** string. The broker maintains:
+
+- `{queue_name}_fairness_set` — a Redis Set tracking all active disambiguators
+- `{queue_name}_fairness_round_robin` — a Redis List used as a round-robin index
+- `{queue_name}_{disambiguator}_queue` — a per-disambiguator sorted set
+
+A Lua script atomically pops the next disambiguator from the round-robin list, fetches the lowest-score message from that sub-queue, and re-appends the disambiguator to the back of the list so the next consumer gets a different producer.
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+
+// Consume with fairness enabled
+let message = queue.consume_with_options(
+    "my-queue",
+    ConsumeOptions {
+        fairness: Some(true),
+        ..Default::default()
+    },
+).await?;
+```
+
+## Scheduling
+
+When `enable_scheduling(true)` is set on the builder, messages published with a `delay` or `scheduled_at` option receive a future timestamp as their sorted set score. The consumer script compares the score against the current time and skips messages that are not yet due, returning them to the queue.
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use std::time::Duration;
+
+// Delay a message by 30 seconds
+queue.publish_with_options(
+    "my-queue",
+    &my_message,
+    PublishOptions {
+        delay: Some(Duration::from_secs(30)),
+        ..Default::default()
+    },
+).await?;
+```
+
+<Tip>
+  Scheduling does **not** require a separate daemon — the broker checks the score on every `consume` call and naturally skips future-dated messages.
+</Tip>
+
+## Message Lifecycle
+
+```
+publish ──► sorted set (score = priority × ts)
+               │
+          (consume)
+               │
+               ▼
+        processing list  ──► (acknowledge) ──► deleted
+               │
+          (reject / error)
+               │
+        ┌──────┴───────────────────┐
+        │  attempts < max_retries  │  attempts ≥ max_retries
+        ▼                          ▼
+   re-enqueue                 failed list
+```
+
+## Management API
+
+Enable the `management` feature to unlock `queue_status()` introspection for Redis queues:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis", "management"] }
+```
+
+<Note>
+  The `management` feature is only supported for Redis and RabbitMQ. SurrealDB queues are excluded from management builds.
+</Note>
+
+## Supported Features
+
+| Feature | Supported |
+|---|---|
+| Priority queues | ✅ |
+| Scheduling (`delay` / `scheduled_at`) | ✅ (requires `enable_scheduling(true)`) |
+| Fairness queues | ✅ |
+| Message TTL | ✅ |
+| `size()` | ✅ |
+| Management API | ✅ (requires `management` feature) |
+| Batch consume | ✅ |

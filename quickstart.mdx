@@ -1,47 +1,336 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Broccoli Queue in Rust"
+sidebarTitle: "Quickstart"
+description: "Learn how to publish and consume your first typed message with Broccoli Queue in Rust. Goes from zero to a working producer-consumer setup in minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through building a complete producer and consumer with Broccoli Queue. By the end you'll have a working Rust program that publishes typed job payloads to a Redis queue and processes them with a concurrent pool of async workers — all with full compile-time type safety.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Note>
+  You'll need a Redis server running locally. The examples below assume `redis://localhost:6379`. If you're using a different broker, see the [Installation](/installation) page for RabbitMQ and SurrealDB connection URL formats.
+</Note>
 
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+## Step-by-step Setup
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Add Broccoli Queue to Cargo.toml">
+    Open your project's `Cargo.toml` and add the following dependencies. The `redis` feature is the default and enables the Redis broker. You'll also need `tokio` for the async runtime and `serde` for message serialization.
 
-    ```bash
-    npm install your-package
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["redis"] }
+    tokio = { version = "1", features = ["full"] }
+    serde = { version = "1", features = ["derive"] }
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
 
-    ```bash
-    your-cli init
+  <Step title="Define Your Message Payload">
+    Your job payload is a plain Rust struct. Derive `Debug`, `Clone`, `Serialize`, and `Deserialize` — that's all Broccoli Queue requires to publish and consume it safely.
+
+    ```rust
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JobPayload {
+        id: String,
+        task_name: String,
+    }
     ```
+
+    The struct can contain any field types that are themselves serializable, including nested structs, `Vec`, `Option`, `chrono::DateTime`, and so on.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
+  <Step title="Build the Queue">
+    Use `BroccoliQueue::builder` with your broker URL and configure the pool size and retry strategy. The `.build().await?` call establishes the connection pool.
+
+    ```rust
+    use broccoli_queue::queue::BroccoliQueue;
+
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
     ```
+
+    `Default::default()` gives you a `RetryStrategy` with three retry attempts and retries enabled. You can customise this with `RetryStrategy::new().with_attempts(5).retry_failed(true)`.
+  </Step>
+
+  <Step title="Publish a Single Message">
+    Call `queue.publish` with the topic name, an optional disambiguator (used for fairness queues), a reference to your payload, and optional publish options.
+
+    ```rust
+    use broccoli_queue::queue::BroccoliQueue;
+
+    let payload = JobPayload {
+        id: "job-1".to_string(),
+        task_name: "process_data".to_string(),
+    };
+
+    let published = queue.publish("jobs", None, &payload, None).await?;
+    println!("Published message with task_id: {}", published.task_id);
+    ```
+
+    The method returns a `BrokerMessage<JobPayload>` containing the broker-assigned `task_id` UUID, which you can use to cancel the message later with `queue.cancel("jobs", task_id)`.
+  </Step>
+
+  <Step title="Publish a Batch of Messages">
+    For higher throughput, send multiple messages in a single broker round-trip using `publish_batch`. Pass any iterator of your payload type.
+
+    ```rust
+    let jobs = vec![
+        JobPayload {
+            id: "job-2".to_string(),
+            task_name: "generate_report".to_string(),
+        },
+        JobPayload {
+            id: "job-3".to_string(),
+            task_name: "send_email".to_string(),
+        },
+    ];
+
+    let published = queue.publish_batch("jobs", None, jobs, None).await?;
+    println!("Published {} messages", published.len());
+    ```
+
+    You can also pass `Some(PublishOptions { delay: Some(Duration::seconds(10)), .. })` as the last argument to delay delivery of the entire batch.
+  </Step>
+
+  <Step title="Consume and Process Messages">
+    `process_messages` starts an infinite consumer loop. Provide the topic name, the number of concurrent worker tasks (`Some(n)`), optional consume options, and a handler closure. On success the message is automatically acknowledged; on error it is rejected and retried according to your `RetryStrategy`.
+
+    ```rust
+    use broccoli_queue::brokers::broker::BrokerMessage;
+
+    queue
+        .process_messages(
+            "jobs",
+            Some(2), // spin up 2 concurrent workers
+            None,
+            |message: BrokerMessage<JobPayload>| async move {
+                println!(
+                    "Processing job: {} ({})",
+                    message.payload.id,
+                    message.payload.task_name
+                );
+                // do real work here...
+                Ok(())
+            },
+        )
+        .await?;
+    ```
+
+    Pass `None` for concurrency to run a single worker on the calling task instead of spawning additional Tokio tasks.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Full Producer Example
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+The following is the complete publisher from the Broccoli Queue examples directory. It demonstrates batch publishing with delayed delivery via `PublishOptions`.
+
+```rust
+use broccoli_queue::{
+    error::BroccoliError,
+    queue::{BroccoliQueue, PublishOptions},
+};
+use serde::{Deserialize, Serialize};
+use time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+    parameters: Parameters,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Parameters {
+    input_data: String,
+    priority: u8,
+    timeout_seconds: u32,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    let queue_url = "redis://localhost:6380";
+
+    let queue = BroccoliQueue::builder(queue_url)
+        .failed_message_retry_strategy(Default::default())
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    // Create some example jobs to publish with a 10-second delay
+    let scheduled_jobs = vec![
+        JobPayload {
+            id: "job-1".to_string(),
+            task_name: "process_data".to_string(),
+            parameters: Parameters {
+                input_data: "data-1".to_string(),
+                priority: 1,
+                timeout_seconds: 300,
+            },
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-2".to_string(),
+            task_name: "generate_report".to_string(),
+            parameters: Parameters {
+                input_data: "data-2".to_string(),
+                priority: 2,
+                timeout_seconds: 600,
+            },
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    println!("Publishing delayed jobs...");
+    let scheduled_jobs = queue
+        .publish_batch(
+            "jobs",
+            None,
+            scheduled_jobs,
+            Some(PublishOptions {
+                delay: Some(Duration::seconds(10)),
+                scheduled_at: None,
+                ttl: None,
+                priority: None,
+            }),
+        )
+        .await?;
+
+    println!(
+        "Published scheduled jobs: {:?}",
+        scheduled_jobs.iter().map(|j| j.task_id).collect::<Vec<_>>()
+    );
+
+    // Publish a second batch immediately (no options)
+    let immediate_jobs = vec![
+        JobPayload {
+            id: "job-3".to_string(),
+            task_name: "process_data".to_string(),
+            parameters: Parameters {
+                input_data: "data-3".to_string(),
+                priority: 1,
+                timeout_seconds: 300,
+            },
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-4".to_string(),
+            task_name: "generate_report".to_string(),
+            parameters: Parameters {
+                input_data: "data-4".to_string(),
+                priority: 2,
+                timeout_seconds: 600,
+            },
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    println!("Publishing immediate jobs...");
+    let immediate_jobs = queue
+        .publish_batch("jobs", None, immediate_jobs, None)
+        .await?;
+
+    println!(
+        "Published immediate jobs: {:?}",
+        immediate_jobs.iter().map(|j| j.task_id).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+```
+
+## Full Consumer Example
+
+The following is the complete consumer from the Broccoli Queue examples directory. It shows both `process_messages` (simple handler) and `process_messages_with_handlers` (separate success and error callbacks) running with concurrent workers.
+
+```rust
+use broccoli_queue::{error::BroccoliError, queue::BroccoliQueue};
+use serde::{Deserialize, Serialize};
+use std::{error::Error, time::Duration};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+    parameters: Parameters,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Parameters {
+    input_data: String,
+    priority: u8,
+    timeout_seconds: u32,
+}
+
+async fn process_job(job: JobPayload) -> Result<(), BroccoliError> {
+    println!("Processing job: {} ({})", job.id, job.task_name);
+    // Simulate some work
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    Ok(())
+}
+
+async fn success_handler(msg: JobPayload) -> Result<(), BroccoliError> {
+    println!("Successfully processed message: {msg:?}");
+    Ok(())
+}
+
+async fn error_handler(msg: JobPayload, err: BroccoliError) -> Result<(), BroccoliError> {
+    eprintln!("Failed to process message: {}. Error: {}", msg.id, err);
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
+    let queue_url = "redis://localhost:6380";
+
+    let queue = BroccoliQueue::builder(queue_url)
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // Simple: process messages with 4 concurrent workers
+    queue
+        .process_messages("jobs", Some(4), None, |msg| async move {
+            process_job(msg.payload).await
+        })
+        .await
+        .unwrap();
+
+    // Advanced: separate success and error callbacks with 5 concurrent workers
+    queue
+        .process_messages_with_handlers(
+            "jobs",
+            Some(5),
+            None,
+            |msg| async move { process_job(msg.payload).await },
+            |msg, _result| async { success_handler(msg.payload).await },
+            |msg, err| async { error_handler(msg.payload, err).await },
+        )
+        .await?;
+
+    println!("Consumer shutdown complete");
+    Ok(())
+}
+```
+
+<Tip>
+  Run your producer and consumer in separate terminal windows, or use `tokio::spawn` to run both in the same process. Because `process_messages` loops indefinitely, place it at the end of your `main` function or inside a dedicated spawned task.
 </Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="wrench" href="/installation">
+    Explore all feature flags, broker-specific Cargo.toml snippets, and connection URL formats for Redis, RabbitMQ, and SurrealDB.
+  </Card>
+  <Card title="API Reference" icon="book" href="https://docs.rs/broccoli_queue">
+    Full docs.rs reference for `BroccoliQueue`, `RetryStrategy`, `PublishOptions`, `ConsumeOptions`, and all broker traits.
+  </Card>
+</CardGroup>

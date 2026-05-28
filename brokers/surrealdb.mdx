@@ -1,0 +1,242 @@
+---
+title: "SurrealDB Broker: Embedded and Remote Backend for Broccoli"
+sidebarTitle: "SurrealDB"
+description: "Use SurrealDB as the message broker for Broccoli Queue. Supports in-memory mode for testing and remote WebSocket connections with namespace and database configuration."
+---
+
+SurrealDB is the third supported backend for Broccoli Queue, and it stands out for its flexibility: it can run entirely in-process with zero external dependencies using `mem://` mode, or connect to a remote SurrealDB server over WebSockets. This makes it especially useful for integration testing, embedded deployments, and applications that already use SurrealDB as their primary database and want to colocate their task queue without spinning up a separate Redis or RabbitMQ instance.
+
+<Note>
+  The SurrealDB broker is functional but considered **beta**. Redis is recommended for production workloads. Some features available in the Redis broker — such as fairness queues and `size()` — are not yet implemented for SurrealDB.
+</Note>
+
+## Installation
+
+Enable the `surrealdb` feature in your `Cargo.toml`:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["surrealdb"] }
+```
+
+To use SurrealDB as your only broker (omitting the default Redis feature):
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", default-features = false, features = ["surrealdb"] }
+```
+
+The `surrealdb` feature pulls in `surrealdb` v2.3.6 (with the `kv-mem` engine for in-memory support) and `url` for URL parsing.
+
+## Connection URL Formats
+
+<CardGroup cols={2}>
+  <Card title="Remote WebSocket" icon="globe">
+    ```
+    ws://localhost:8000/?ns=myns&db=mydb
+    ```
+    Connects to a running SurrealDB server over WebSocket. The `ns` and `db` query parameters set the namespace and database.
+  </Card>
+  <Card title="In-Memory" icon="microchip">
+    ```
+    mem://
+    ```
+    Runs an embedded SurrealDB instance inside your process. No server required — ideal for tests.
+  </Card>
+</CardGroup>
+
+## Connecting with an Existing `Surreal` Instance
+
+A unique capability of the SurrealDB broker is `BroccoliQueue::builder_with(db)`, which lets you pass a pre-configured `surrealdb::Surreal<Any>` connection. This is useful when your application already holds a SurrealDB handle and you want the queue to share the same connection:
+
+```rust
+use surrealdb::Surreal;
+use surrealdb::engine::any::Any;
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Your existing SurrealDB connection
+    let db: Surreal<Any> = surrealdb::engine::any::connect("ws://localhost:8000").await?;
+    db.use_ns("myns").use_db("mydb").await?;
+
+    // Pass it directly to Broccoli
+    let queue = BroccoliQueue::builder_with(db)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+When `builder_with(db)` is used, the broker skips the URL-based connection step and uses the provided handle directly.
+
+## Full Setup Example
+
+<Tabs>
+  <Tab title="In-Memory (Testing)">
+    ```rust
+    use broccoli_queue::queue::BroccoliQueue;
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("mem://")
+            .build()
+            .await?;
+
+        Ok(())
+    }
+    ```
+
+    No external process is needed. The queue lives entirely within the Tokio runtime of your application and is torn down when the process exits.
+  </Tab>
+  <Tab title="Remote SurrealDB">
+    ```rust
+    use broccoli_queue::queue::BroccoliQueue;
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder(
+            "ws://localhost:8000/?ns=myns&db=mydb"
+        )
+        .failed_message_retry_strategy(Default::default())
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+        Ok(())
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Local Development
+
+Start a remote SurrealDB server with Docker:
+
+```bash
+docker run -d -p 8000:8000 surrealdb/surrealdb:latest start
+```
+
+Then connect with:
+
+```
+ws://localhost:8000/?ns=myns&db=mydb
+```
+
+## Internal Data Model
+
+The SurrealDB broker uses three record types stored as SurrealDB tables:
+
+<Steps>
+  <Step title="Message Records — InternalSurrealDBBrokerMessage">
+    The actual message content is stored in a table named after the queue:
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `id` | `RecordId` | SurrealDB record ID: `{queue_name}:{task_id}` |
+    | `task_id` | `surrealdb::sql::Uuid` | External UUID identifier |
+    | `payload` | `String` | Serialized message content |
+    | `attempts` | `u8` | Number of processing attempts made |
+  </Step>
+
+  <Step title="Queue Entries — InternalSurrealDBBrokerMessageEntry">
+    A separate index table tracks the ordering of pending messages. Its record ID encodes priority and timestamp for efficient sorted retrieval:
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `id` | `RecordId` | Composite key: `[priority, timestamp, task_id]` |
+    | `message_id` | `RecordId` | Reference back to the message record |
+    | `priority` | `i64` | Priority level (1–5) for sorting |
+    | `timestamp` | `DateTime<Utc>` | Enqueue time, used for FIFO ordering within priority |
+  </Step>
+
+  <Step title="Failed Messages — InternalSurrealDBBrokerFailedMessage">
+    Messages that exceed the retry limit are moved to a failed table:
+
+    | Field | Type | Description |
+    |---|---|---|
+    | `id` | `Option<Uuid>` | Original task UUID |
+    | `original_msg` | `InternalSurrealDBBrokerMessage` | Full copy of the failed message |
+    | `timestamp` | `DateTime<Utc>` | When the message was moved to failed |
+  </Step>
+</Steps>
+
+## Scheduling
+
+Scheduling is natively supported by the SurrealDB broker — no plugins or external processes are required. When `enable_scheduling(true)` is set on the builder, messages published with `delay` or `scheduled_at` are stored in a separate scheduled queue table and only become eligible for consumption once their target time is reached.
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use std::time::Duration;
+
+let queue = BroccoliQueue::builder("mem://")
+    .enable_scheduling(true)
+    .build()
+    .await?;
+
+queue.publish_with_options(
+    "my-queue",
+    &my_message,
+    PublishOptions {
+        delay: Some(Duration::from_secs(30)),
+        ..Default::default()
+    },
+).await?;
+```
+
+## Consuming and Concurrency
+
+The SurrealDB broker's `consume()` method first attempts a non-blocking poll (`try_consume`). If no message is available, it subscribes to a **SurrealDB live query** on the queue table and waits for a `Create` notification — making the blocking consume efficient without polling.
+
+<Note>
+  Under high concurrency, the SurrealDB broker may return a `BroccoliError::BrokerNonIdempotentOp` error when two consumers race to claim the same message. The `process_messages` helper handles this gracefully by logging the conflict and retrying. If you call `consume` directly in your own loop, handle this error by continuing to the next iteration.
+</Note>
+
+```rust
+loop {
+    match queue.try_consume::<MyMessage>("my-queue").await {
+        Ok(Some(msg)) => { /* process */ }
+        Ok(None) => continue,
+        Err(broccoli_queue::error::BroccoliError::BrokerNonIdempotentOp) => {
+            // Another consumer won the race — try again
+            log::trace!("Concurrent consumer conflict, retrying");
+            continue;
+        }
+        Err(e) => return Err(e.into()),
+    }
+}
+```
+
+## Limitations
+
+<CardGroup cols={2}>
+  <Card title="No fairness queues" icon="scale-balanced">
+    Disambiguator-based fairness routing is not supported. The `disambiguator` parameter is accepted but ignored.
+  </Card>
+  <Card title="No size() support" icon="chart-bar">
+    `size()` returns `BroccoliError::NotImplemented`.
+  </Card>
+  <Card title="No TTL support" icon="hourglass-end">
+    `publish_with_options` with a `ttl` returns `BroccoliError::NotImplemented`.
+  </Card>
+  <Card title="No management API" icon="gear">
+    The `management` feature is not supported for SurrealDB. When the `management` feature flag is enabled, only Redis and RabbitMQ brokers are available.
+  </Card>
+</CardGroup>
+
+## Supported Features
+
+| Feature | Supported |
+|---|---|
+| In-memory mode (`mem://`) | ✅ |
+| Remote WebSocket connection | ✅ |
+| Existing connection (`builder_with`) | ✅ |
+| Priority queues | ✅ |
+| Scheduling (`delay` / `scheduled_at`) | ✅ (requires `enable_scheduling(true)`) |
+| Live query blocking consume | ✅ |
+| Batch consume (`try_consume_batch`) | ✅ |
+| Fairness queues | ❌ |
+| `size()` | ❌ |
+| Message TTL | ❌ |
+| Management API | ❌ |

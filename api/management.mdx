@@ -1,0 +1,160 @@
+---
+title: "Management API: Queue Status Introspection for Broccoli"
+sidebarTitle: "Management"
+description: "Enable the management Cargo feature to access queue status introspection in Broccoli Queue. Returns queue size, processing count, failed count, and type classification."
+---
+
+The `management` Cargo feature adds queue status introspection to `BroccoliQueue`, letting you observe how many messages are waiting, currently being processed, or sitting in the failed queue — all at runtime and without connecting to a separate admin interface. This is useful for building dashboards, autoscaling triggers, alerting pipelines, or smoke tests that assert queue depth after publishing a known batch of messages.
+
+## Enabling the Feature
+
+Add the `management` feature alongside your chosen broker feature in `Cargo.toml`:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis", "management"] }
+```
+
+<Note>
+  The `management` feature is supported with the **Redis** and **RabbitMQ** backends. It is not available for the SurrealDB broker.
+</Note>
+
+<Warning>
+  Calling `queue_status` without the `management` feature enabled will result in a **compile error**. The method is conditionally compiled with `#[cfg(feature = "management")]` and will not exist in builds without the feature.
+</Warning>
+
+## `BroccoliQueue::queue_status`
+
+```rust
+#[cfg(feature = "management")]
+pub async fn queue_status(
+    &self,
+    queue_name: String,
+    disambiguator: Option<String>,
+) -> Result<QueueStatus, BroccoliError>
+```
+
+Retrieves the current status of the specified queue. Returns a `QueueStatus` snapshot on success, or `BroccoliError::QueueStatus` on failure.
+
+### Parameters
+
+<ParamField path="queue_name" type="String" required>
+  The name of the topic / queue to inspect. This must match the name used when publishing and consuming messages.
+</ParamField>
+
+<ParamField path="disambiguator" type="Option<String>">
+  The fairness sub-queue identifier to inspect. Pass `Some("tenant_a")` to get the status of a specific fairness slot, or `None` for the standard (non-fairness) queue view.
+</ParamField>
+
+## `QueueStatus` Struct
+
+`QueueStatus` is a snapshot of a queue's state at the moment `queue_status` was called. It derives `Debug` and `Clone`.
+
+<ResponseField name="name" type="String" required>
+  The queue name as registered with the broker. Matches the `queue_name` argument passed to `queue_status`.
+</ResponseField>
+
+<ResponseField name="queue_type" type="QueueType" required>
+  Classification of the queue. See [`QueueType`](#queuetype-enum) below for the full list of variants.
+</ResponseField>
+
+<ResponseField name="size" type="usize" required>
+  Number of messages currently waiting in the queue and not yet being processed. This is the primary depth metric for back-pressure monitoring and autoscaling decisions.
+</ResponseField>
+
+<ResponseField name="processing" type="usize" required>
+  Number of messages that have been consumed by a worker and are actively being processed (i.e. they are in the `{name}_processing` queue and have not yet been acknowledged or rejected).
+</ResponseField>
+
+<ResponseField name="failed" type="usize" required>
+  Number of messages in the `{name}_failed` dead-letter queue — messages that exceeded the configured retry limit. A non-zero `failed` count usually warrants investigation.
+</ResponseField>
+
+<ResponseField name="disambiguator_count" type="Option<usize>">
+  When the queue is a fairness queue (`QueueType::Fairness`), this field contains the number of active sub-queues (distinct disambiguator values). `None` for standard queues.
+</ResponseField>
+
+## `QueueType` Enum
+
+`QueueType` classifies what role a queue plays. It derives `Debug`, `Clone`, `PartialEq`, `Eq`, and `Display` (via `derive_more`).
+
+| Variant | Display string | Description |
+|---|---|---|
+| `Failed` | `"failed"` | The `{name}_failed` dead-letter queue holding messages that exhausted all retry attempts. |
+| `Processing` | `"processing"` | The `{name}_processing` queue holding messages currently being handled by workers. |
+| `Main` | `"main"` | The primary queue holding messages waiting to be consumed. |
+| `Fairness` | `"fairness"` | A fairness sub-queue, partitioned by a disambiguator key for fair multi-tenant interleaving. |
+
+The `Display` implementation lets you use `{}` formatting directly in log messages and UI labels:
+
+```rust
+println!("Queue type: {}", status.queue_type); // "main", "failed", etc.
+```
+
+## The `QueueManagement` Trait
+
+`queue_status` delegates to the `QueueManagement` trait, which broker implementations satisfy when the `management` feature is enabled:
+
+```rust
+#[async_trait::async_trait]
+pub trait QueueManagement {
+    async fn get_queue_status(
+        &self,
+        queue_name: String,
+        disambiguator: Option<String>,
+    ) -> Result<QueueStatus, BroccoliError>;
+}
+```
+
+If you are writing a custom broker that should support management introspection, implement both `Broker` and `QueueManagement`, then satisfy the `BrokerWithManagement` supertrait (a blanket internal trait that combines the two).
+
+## Usage Examples
+
+### Basic queue status
+
+```rust
+let status = queue.queue_status("jobs".to_string(), None).await?;
+println!("Queue: {}", status.name);
+println!("Waiting: {}", status.size);
+println!("Processing: {}", status.processing);
+println!("Failed: {}", status.failed);
+println!("Type: {}", status.queue_type);
+```
+
+### Fairness queue status
+
+When using disambiguator-based fairness queues, pass the disambiguator to scope the status to a specific sub-queue. The `disambiguator_count` field tells you how many distinct sub-queues are currently active across all tenants:
+
+```rust
+let status = queue.queue_status(
+    "jobs".to_string(),
+    Some("tenant_a".to_string())
+).await?;
+if let Some(count) = status.disambiguator_count {
+    println!("Active tenants: {}", count);
+}
+```
+
+### Back-pressure check before publishing
+
+Use `size` to implement producer-side back-pressure — pause publishing if the queue depth exceeds a threshold:
+
+```rust
+let status = queue.queue_status("jobs".to_string(), None).await?;
+if status.size > 10_000 {
+    eprintln!("Queue depth {} exceeds threshold — pausing publish", status.size);
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+}
+```
+
+### Alerting on failed messages
+
+```rust
+let status = queue.queue_status("jobs".to_string(), None).await?;
+if status.failed > 0 {
+    eprintln!(
+        "ALERT: {} messages in failed queue for topic 'jobs'",
+        status.failed
+    );
+}
+```

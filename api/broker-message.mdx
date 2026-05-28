@@ -1,0 +1,98 @@
+---
+title: "BrokerMessage<T> — Typed Message Envelope Reference"
+sidebarTitle: "BrokerMessage"
+description: "BrokerMessage<T> wraps every message in Broccoli Queue with a task ID, attempt counter, payload, and optional disambiguator. Reference for all fields and type constraints."
+---
+
+`BrokerMessage<T>` is the typed envelope that wraps every message consumed from a Broccoli Queue. Whether you call `consume`, `try_consume`, or use `process_messages` with a handler closure, your code always receives a `BrokerMessage<T>` — never a raw string or an untyped value. The struct carries a unique task identifier, the deserialized payload, the number of processing attempts, and an optional fairness-routing key called the disambiguator.
+
+## Type Definition
+
+`BrokerMessage<T>` has a single generic constraint: `T: Clone`. The struct itself derives `Debug`, `Clone`, `serde::Serialize`, and `serde::Deserialize`, making it safe to log, clone across async tasks, and round-trip through JSON.
+
+```rust
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BrokerMessage<T: Clone> {
+    pub task_id: uuid::Uuid,
+    pub payload: T,
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+Methods on `BrokerMessage<T>` (such as `new`) require the stricter bound `T: Clone + serde::Serialize`. Methods that deserialize wire data (such as `InternalBrokerMessage::into_message`) additionally require `T: serde::de::DeserializeOwned`.
+
+## Fields
+
+<ResponseField name="task_id" type="uuid::Uuid" required>
+  A globally unique identifier auto-assigned by the broker when the message is first published. Use `task_id` to correlate log entries, deduplicate processing, or cancel an enqueued message by ID.
+</ResponseField>
+
+<ResponseField name="payload" type="T" required>
+  The actual message content, fully deserialized into your concrete type `T`. The broker transparently serializes `T` to JSON on publish and deserializes it back on consume. Any type that implements `serde::Serialize + serde::de::DeserializeOwned + Clone` is supported.
+</ResponseField>
+
+<ResponseField name="attempts" type="u8" required>
+  The number of times this message has been attempted. Starts at `0` for a freshly published message. Each time a handler returns an error and the broker requeues the message, the broker increments this counter. Use it to implement escalating back-off or last-chance alerting.
+</ResponseField>
+
+<ResponseField name="disambiguator" type="Option<String>">
+  The fairness-queue routing key. When set, the broker routes the message to the sub-queue identified by this string (e.g. a tenant ID or shard key), ensuring fair interleaving across producers. `None` for messages published to a standard, non-fairness queue.
+</ResponseField>
+
+## Constructor
+
+`BrokerMessage::new` is used internally by the library when you call `BroccoliQueue::publish`. You rarely need to call it directly, but it is public for custom broker implementations and testing.
+
+```rust
+impl<T: Clone + serde::Serialize> BrokerMessage<T> {
+    pub fn new(payload: T, disambiguator: Option<String>) -> Self
+}
+```
+
+`new` generates a fresh `uuid::Uuid::new_v4()` for `task_id`, sets `attempts` to `0`, and stores the provided `payload` and `disambiguator`.
+
+## Usage in Handlers
+
+### Basic handler
+
+Pass a closure or async function that accepts `BrokerMessage<T>` to `process_messages`. The `payload` field gives you the fully typed value; `task_id` and `attempts` are always available for observability.
+
+```rust
+|msg: BrokerMessage<MyJob>| async move {
+    println!("task_id={} attempt={}", msg.task_id, msg.attempts);
+    let job = msg.payload;
+    // process job...
+    Ok(())
+}
+```
+
+### Checking attempts for custom retry logic
+
+`attempts` lets you implement custom escalation strategies without relying solely on the broker's retry counter. For example, notify an operations team on the last permissible retry rather than letting the message silently land in the failed queue:
+
+```rust
+|msg: BrokerMessage<MyJob>| async move {
+    if msg.attempts >= 2 {
+        // Last chance — do something different
+        notify_ops_team(&msg).await?;
+    }
+    process_job(msg.payload).await
+        .map_err(|e| BroccoliError::Job(e.to_string()))
+}
+```
+
+## Wire Format: `InternalBrokerMessage`
+
+<Note>
+  `InternalBrokerMessage` is an internal implementation detail. Handlers always receive `BrokerMessage<T>` — you never interact with `InternalBrokerMessage` directly.
+</Note>
+
+`InternalBrokerMessage` is the wire format used by broker implementations. Its `payload` field holds the JSON-serialized string of `T` rather than the deserialized value, which allows the broker layer to store and forward messages without knowing the concrete type at compile time.
+
+Two conversions bridge the two representations:
+
+- **`From<BrokerMessage<T>> for InternalBrokerMessage`** — called on publish; serializes `payload` to a JSON string and stringifies `task_id`.
+- **`InternalBrokerMessage::into_message::<T>()`** — called on consume; deserializes the JSON string back into `T` and parses `task_id` as a `uuid::Uuid`.
+
+Both conversions are invoked transparently by `BroccoliQueue::publish` and `BroccoliQueue::consume`. If deserialization fails, `into_message` returns `BroccoliError::Broker` with a descriptive message.

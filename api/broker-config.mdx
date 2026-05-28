@@ -1,0 +1,150 @@
+---
+title: "BrokerConfig — Internal Broker Configuration Reference"
+sidebarTitle: "BrokerConfig"
+description: "BrokerConfig holds the internal configuration passed to broker implementations in Broccoli Queue, including pool size, retry settings, and scheduling enablement."
+---
+
+`BrokerConfig` is the internal configuration struct passed to broker implementations when a connection is established. It carries all the behavioral knobs that govern retry logic, connection pool sizing, and optional features such as delayed message delivery. In normal usage you never construct `BrokerConfig` directly — the `BroccoliQueueBuilder` fluent API assembles it for you and passes it to the broker during `build()`. The struct is documented here for authors of custom broker implementations and for advanced use cases that require inspecting or pre-building the configuration by hand.
+
+<Note>
+  Prefer `BroccoliQueue::builder(broker_url)` and its chained methods over constructing `BrokerConfig` directly. `BrokerConfig` is part of the public API to support custom broker implementations — for standard usage, `BroccoliQueueBuilder` is the correct entry point.
+</Note>
+
+## `BrokerConfig` Fields
+
+<ResponseField name="retry_attempts" type="Option<u8>">
+  Maximum number of times a failed message is retried before it is moved to the dead-letter (failed) queue. Defaults to `Some(3)`. Set to `Some(0)` to disable retries even when `retry_failed` is `true`.
+</ResponseField>
+
+<ResponseField name="retry_failed" type="Option<bool>">
+  Whether the broker should requeue a message after a handler returns an error. Defaults to `Some(true)`. When set to `Some(false)`, a failed message is moved immediately to the failed queue regardless of the `retry_attempts` setting.
+</ResponseField>
+
+<ResponseField name="pool_connections" type="Option<u8>">
+  Number of connections to maintain in the broker connection pool. Defaults to `Some(10)`. Increase this value when running many concurrent consumers to avoid connection contention.
+</ResponseField>
+
+<ResponseField name="enable_scheduling" type="Option<bool>">
+  Enables delayed message delivery via `PublishOptions::delay` or `PublishOptions::scheduled_at`. Defaults to `Some(false)`. When using RabbitMQ, enabling scheduling requires the [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin to be installed on the broker.
+</ResponseField>
+
+<ResponseField name="surrealdb_connection" type="Option<Surreal<Any>>">
+  *(Available only with the `surrealdb` Cargo feature.)* An existing `surrealdb::Surreal<surrealdb::engine::any::Any>` connection to reuse instead of opening a new one. Useful when the application already holds a SurrealDB connection pool. Defaults to `None`.
+</ResponseField>
+
+## Default Values
+
+`BrokerConfig` implements `Default`:
+
+```rust
+BrokerConfig {
+    retry_attempts: Some(3),
+    retry_failed: Some(true),
+    pool_connections: Some(10),
+    enable_scheduling: Some(false),
+    // surrealdb feature only:
+    surrealdb_connection: None,
+}
+```
+
+Calling `BrokerConfig::default()` gives you a production-ready baseline. `BroccoliQueueBuilder::build()` merges any builder-level overrides on top of these defaults before forwarding the config to the broker.
+
+## The `Broker` Trait
+
+The `Broker` trait is the interface that all broker implementations must satisfy. If you are writing a custom broker (for example, wrapping a proprietary message bus), implement this trait and use `BrokerConfig` to parameterize its behavior.
+
+```rust
+#[async_trait::async_trait]
+pub trait Broker: Send + Sync {
+    async fn connect(&mut self, broker_url: &str) -> Result<(), BroccoliError>;
+
+    async fn publish(
+        &self,
+        queue_name: &str,
+        disambiguator: Option<String>,
+        message: &[InternalBrokerMessage],
+        options: Option<PublishOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+
+    async fn consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<InternalBrokerMessage, BroccoliError>;
+
+    async fn try_consume(
+        &self,
+        queue_name: &str,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Option<InternalBrokerMessage>, BroccoliError>;
+
+    async fn try_consume_batch(
+        &self,
+        queue_name: &str,
+        batch_size: usize,
+        options: Option<ConsumeOptions>,
+    ) -> Result<Vec<InternalBrokerMessage>, BroccoliError>; // has default impl
+
+    async fn acknowledge(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    async fn reject(
+        &self,
+        queue_name: &str,
+        message: InternalBrokerMessage,
+    ) -> Result<(), BroccoliError>;
+
+    async fn cancel(
+        &self,
+        queue_name: &str,
+        message_id: String,
+    ) -> Result<(), BroccoliError>;
+
+    async fn size(
+        &self,
+        queue_name: &str,
+    ) -> Result<HashMap<String, u64>, BroccoliError>;
+}
+```
+
+### Method summaries
+
+| Method | Blocking | Description |
+|---|---|---|
+| `connect` | Yes | Establish a connection to the broker using the given URL. Called once during `build()`. |
+| `publish` | No | Enqueue one or more `InternalBrokerMessage`s. Returns the enqueued messages (with broker-assigned metadata). |
+| `consume` | **Yes** | Block until a message is available, then return it and move it to the processing queue. |
+| `try_consume` | No | Return `Some(message)` if one is immediately available, `None` otherwise. |
+| `try_consume_batch` | No | Return up to `batch_size` messages without blocking. Has a default implementation built on `try_consume`. |
+| `acknowledge` | No | Remove a successfully processed message from the processing queue. |
+| `reject` | No | Re-enqueue or dead-letter a failed message according to the retry configuration. |
+| `cancel` | No | Remove a message from the queue without processing it. |
+| `size` | No | Return a map of queue-name → message count. |
+
+## `BrokerType` Enum
+
+`BrokerType` selects the built-in broker implementation to use. Each variant is gated behind the corresponding Cargo feature flag.
+
+```rust
+pub enum BrokerType {
+    #[cfg(feature = "redis")]
+    Redis,
+
+    #[cfg(feature = "rabbitmq")]
+    RabbitMQ,
+
+    #[cfg(feature = "surrealdb")]
+    SurrealDB,
+}
+```
+
+| Variant | Feature flag | Broker URL scheme |
+|---|---|---|
+| `Redis` | `redis` | `redis://` or `rediss://` |
+| `RabbitMQ` | `rabbitmq` | `amqp://` |
+| `SurrealDB` | `surrealdb` | `ws://`, `wss://`, `mem://`, etc. |
+
+The `BroccoliQueueBuilder` infers the correct `BrokerType` from the URL scheme automatically — you do not need to specify `BrokerType` explicitly in typical usage.

@@ -1,0 +1,297 @@
+---
+title: "Consuming Messages from a Broccoli Queue"
+sidebarTitle: "Consuming"
+description: "Consume messages from Broccoli Queue using blocking, non-blocking, or batch patterns. Process messages concurrently with process_messages and manage ack/reject lifecycle."
+---
+
+Consuming in Broccoli Queue means retrieving messages from a topic and processing them. Broccoli supports three patterns: a high-level loop (`process_messages`) that handles concurrency, acknowledgment, and retries automatically; a variant with explicit success and error callbacks (`process_messages_with_handlers`); and a low-level manual pattern where you call `consume` / `try_consume` yourself and decide when to `acknowledge` or `reject` each message.
+
+---
+
+## Pattern 1 — `process_messages()` (Recommended)
+
+`process_messages()` is the simplest and most robust way to consume messages. It runs an infinite loop, dispatching each message to your handler, and handles acknowledgment and rejection automatically.
+
+```rust
+pub async fn process_messages<T, F, Fut>(
+    &self,
+    topic: &str,
+    concurrency: Option<usize>,
+    consume_options: Option<ConsumeOptions>,
+    handler: F,
+) -> Result<(), BroccoliError>
+where
+    T: DeserializeOwned + Send + Clone + Serialize + 'static,
+    F: Fn(BrokerMessage<T>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = Result<(), BroccoliError>> + Send + 'static,
+```
+
+**Parameters**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `topic` | `&str` | Name of the queue to consume from |
+| `concurrency` | `Option<usize>` | Number of parallel Tokio tasks; `None` means a single sequential loop |
+| `consume_options` | `Option<ConsumeOptions>` | Fairness, auto-ack, wait duration, handler-ack toggle |
+| `handler` | `Fn(BrokerMessage<T>) -> Future<Output = Result<(), BroccoliError>>` | Your message processing closure |
+
+**Acknowledgment behaviour**
+
+- Handler returns `Ok(())` → message is **acknowledged** and removed from the queue.
+- Handler returns `Err(_)` → message is **rejected** and retried according to the `RetryStrategy` configured on the queue builder (default: 3 attempts). Once the retry limit is exhausted the message is moved to `{topic}_failed`.
+
+**Example from `consumer.rs`**
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // Spin up 4 concurrent worker tasks
+    queue
+        .process_messages("jobs", Some(4), None, |msg: BrokerMessage<JobPayload>| async move {
+            println!("Processing job {} ({})", msg.payload.id, msg.payload.task_name);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok(())
+        })
+        .await?;
+
+    Ok(())
+}
+```
+
+---
+
+## Pattern 2 — `process_messages_with_handlers()` (Success / Error Callbacks)
+
+`process_messages_with_handlers()` extends `process_messages()` with two additional callbacks: `on_success` is called after the main handler returns `Ok`, and `on_error` is called after the handler returns `Err`. This is useful for audit logging, metrics, or side-effects that should only run depending on the processing outcome.
+
+```rust
+pub async fn process_messages_with_handlers<T, F, MessageFut, SuccessFut, ErrorFut, S, E, R>(
+    &self,
+    topic: &str,
+    concurrency: Option<usize>,
+    consume_options: Option<ConsumeOptions>,
+    message_handler: F,
+    on_success: S,
+    on_error: E,
+) -> Result<(), BroccoliError>
+```
+
+**Callback signatures**
+
+| Callback | Signature |
+|---|---|
+| `message_handler` | `Fn(BrokerMessage<T>) -> Future<Output = Result<R, BroccoliError>>` |
+| `on_success` | `Fn(BrokerMessage<T>, R) -> Future<Output = Result<(), BroccoliError>>` |
+| `on_error` | `Fn(BrokerMessage<T>, BroccoliError) -> Future<Output = Result<(), BroccoliError>>` |
+
+The generic `R` is the success return value of `message_handler` — it is forwarded verbatim to `on_success`.
+
+**Example from `consumer.rs`**
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+}
+
+async fn process_job(job: JobPayload) -> Result<(), BroccoliError> {
+    println!("Processing job: {} ({})", job.id, job.task_name);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    Ok(())
+}
+
+async fn success_handler(msg: JobPayload) -> Result<(), BroccoliError> {
+    println!("Successfully processed: {msg:?}");
+    Ok(())
+}
+
+async fn error_handler(msg: JobPayload, err: BroccoliError) -> Result<(), BroccoliError> {
+    eprintln!("Failed to process {}: {}", msg.id, err);
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    queue
+        .process_messages_with_handlers(
+            "jobs",
+            Some(5),
+            None,
+            |msg: BrokerMessage<JobPayload>| async move { process_job(msg.payload).await },
+            |msg, _result| async move { success_handler(msg.payload).await },
+            |msg, err| async move { error_handler(msg.payload, err).await },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+<Note>
+  Even when using `on_error`, the message is still **rejected** by `process_messages_with_handlers` after the error callback runs. The callback is a side-effect hook, not a replacement for the rejection logic.
+</Note>
+
+---
+
+## Pattern 3 — Manual Consume / Ack
+
+For full control over the message lifecycle, call `consume()`, `try_consume()`, or their batch variants directly, then call `acknowledge()` or `reject()` yourself.
+
+### Blocking consume
+
+`consume()` blocks the calling task until a message is available.
+
+```rust
+pub async fn consume<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    options: Option<ConsumeOptions>,
+) -> Result<BrokerMessage<T>, BroccoliError>
+```
+
+### Non-blocking consume
+
+`try_consume()` returns `Ok(None)` immediately if no message is available.
+
+```rust
+pub async fn try_consume<T: Clone + Serialize + DeserializeOwned>(
+    &self,
+    topic: &str,
+    options: Option<ConsumeOptions>,
+) -> Result<Option<BrokerMessage<T>>, BroccoliError>
+```
+
+### Batch variants
+
+| Method | Behaviour |
+|---|---|
+| `consume_batch(topic, batch_size, timeout, options)` | Waits up to `timeout` (a `time::Duration`) collecting up to `batch_size` messages |
+| `try_consume_batch(topic, batch_size, options)` | Non-blocking — returns however many messages are immediately available, up to `batch_size` |
+
+### Manual ack / reject / cancel
+
+```rust
+// Confirm successful processing — removes message from the queue
+queue.acknowledge("jobs", msg).await?;
+
+// Signal failure — re-queues for retry or moves to {topic}_failed
+queue.reject("jobs", msg).await?;
+
+// Remove a message by ID without processing it
+queue.cancel("jobs", message_id_string).await?;
+```
+
+**Complete manual example**
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MyJob { id: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let msg: BrokerMessage<MyJob> = queue.consume("jobs", None).await?;
+
+    match do_work(&msg.payload).await {
+        Ok(_) => {
+            queue.acknowledge("jobs", msg).await?;
+        }
+        Err(e) => {
+            eprintln!("Work failed: {e}");
+            queue.reject("jobs", msg).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn do_work(job: &MyJob) -> Result<(), String> {
+    println!("Working on {}", job.id);
+    Ok(())
+}
+```
+
+<Warning>
+  If you consume a message with `auto_ack: true` in `ConsumeOptions`, calling `acknowledge()` or `reject()` on it afterwards will result in a `BroccoliError::Acknowledge` / `BroccoliError::Reject` error because the message has already been removed.
+</Warning>
+
+---
+
+## `ConsumeOptions`
+
+All consume methods accept an `Option<ConsumeOptions>`. Build one with `ConsumeOptions::builder()`:
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+use std::time::Duration;
+
+let opts = ConsumeOptions::builder()
+    .auto_ack(false)          // default — require explicit acknowledge/reject
+    .fairness(true)           // consume from a fairness queue (Redis only)
+    .consume_wait(Duration::from_millis(100)) // sleep between poll iterations
+    .handler_ack(true)        // default — auto-ack after successful handler
+    .build();
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `auto_ack(bool)` | `false` | Acknowledge the message automatically on consume |
+| `fairness(bool)` | `None` (off) | Round-robin across disambiguator sub-queues (Redis only) |
+| `consume_wait(Duration)` | `Duration::ZERO` | Sleep injected into tight poll loops; enables `tokio::spawn` task cancellation |
+| `handler_ack(bool)` | `true` | Set to `false` to skip the automatic acknowledge after a successful handler (useful when a handler spawns a long-running task) |
+
+<Tip>
+  Set `consume_wait` to a small non-zero duration (e.g. `Duration::from_millis(10)`) when running `process_messages` inside a `tokio::spawn` handle that you need to cancel cleanly — Tokio can only abort a task at an `.await` point.
+</Tip>
+
+---
+
+## Inspecting Queue Size
+
+`queue.size(topic)` returns a `HashMap<String, u64>` mapping queue names to their current depth.
+
+```rust
+let sizes = queue.size("jobs").await?;
+for (name, count) in &sizes {
+    println!("{name}: {count} messages");
+}
+```
+
+For standard queues the map contains a single entry keyed by the topic name. For fairness queues it contains one entry per active disambiguator sub-queue. See the [Fairness Queues guide](/guides/fairness) for details.
